@@ -1,0 +1,28 @@
+---
+import GeneratorApp from '../components/GeneratorApp.vue';
+import '../styles/global.css';
+---
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <script is:inline>
+      (() => {
+        const key = 'micro-shop-generator:theme:v1';
+        const saved = localStorage.getItem(key);
+        const mode = saved === 'light' || saved === 'dark' || saved === 'system' ? saved : 'system';
+        const resolved = mode === 'system'
+          ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+          : mode;
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.dataset.themeMode = mode;
+        document.documentElement.style.colorScheme = resolved;
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="description" content="Générateur de micro-boutiques e-commerce assisté par un réseau multi-agents IA." />
+    <title>Micro Shop Studio</title>
+  </head>
+  <body><GeneratorApp client:load /></body>
+</html>

@@ -1,0 +1,595 @@
+import type { AiCallKind, AiCallTrace, AiCallTraceEvent, AiSettings } from '../types/generator';
+import {
+  applyReasoningPayload,
+  isReasoningCompatibilityError,
+  reasoningCandidates,
+  reasoningPromptInstruction,
+  rejectReasoningStrategy,
+  rememberReasoningStrategy,
+  type ReasoningStrategy,
+} from './reasoning';
+
+export interface ChatTextPart {
+  type: 'text';
+  text: string;
+}
+
+export interface ChatImagePart {
+  type: 'image_url';
+  image_url: { url: string };
+}
+
+export type MessageContent = string | Array<ChatTextPart | ChatImagePart>;
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: MessageContent;
+}
+
+interface ProxyErrorPayload {
+  error?: {
+    message?: string;
+    type?: string;
+  };
+}
+
+interface StreamChoice {
+  delta?: {
+    content?: string | Array<{ type?: string; text?: string }>;
+    reasoning?: string | Array<{ type?: string; text?: string }>;
+    reasoning_content?: string | Array<{ type?: string; text?: string }>;
+  };
+  text?: string;
+  message?: {
+    content?: string | Array<{ type?: string; text?: string }>;
+    reasoning?: string | Array<{ type?: string; text?: string }>;
+    reasoning_content?: string | Array<{ type?: string; text?: string }>;
+  };
+  finish_reason?: string | null;
+}
+
+interface StreamPayload {
+  choices?: StreamChoice[];
+}
+
+export interface ChatCompletionResult {
+  content: string;
+  reasoning: string;
+  finishReason: string | null;
+  hadReasoning: boolean;
+  reasoningChars: number;
+  doneMarkerSeen: boolean;
+  reasoningStrategy?: ReasoningStrategy;
+}
+
+export interface ChatCompletionRetryInfo {
+  attempt: number;
+  maxAttempts: number;
+  hadReasoning: boolean;
+  reasoningChars: number;
+  finishReason: string | null;
+  doneMarkerSeen: boolean;
+}
+
+export interface ChatCompletionOptions {
+  json?: boolean;
+  /** Intention métier : reasoning actif pour la conception, inactif pour l'exécution. */
+  thinking?: boolean;
+  temperature?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
+  trace?: { stage: string; kind: AiCallKind };
+  onTrace?: (event: AiCallTraceEvent) => void;
+  onDelta?: (delta: string, accumulated: string) => void;
+  onReasoningDelta?: (delta: string, accumulated: string) => void;
+  onRetry?: (info: ChatCompletionRetryInfo) => void;
+}
+
+async function readError(response: Response): Promise<string> {
+  const text = await response.text();
+  if (!text) return response.statusText || 'Erreur inconnue';
+
+  try {
+    const payload = JSON.parse(text) as ProxyErrorPayload;
+    if (payload.error?.message) return payload.error.message;
+  } catch {
+    // L'upstream peut renvoyer du texte brut ou du HTML.
+  }
+
+  return text.slice(0, 500);
+}
+
+export async function fetchModels(settings: AiSettings): Promise<string[]> {
+  const response = await fetch('/api/openai/models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET /models → ${response.status} ${await readError(response)}`);
+  }
+
+  const payload = (await response.json()) as {
+    data?: Array<{ id?: string }>;
+    models?: Array<{ id?: string } | string>;
+  };
+  const raw = payload.data ?? payload.models ?? [];
+
+  return raw
+    .map((item) => (typeof item === 'string' ? item : item.id ?? ''))
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function traceId(): string {
+  return `ai-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function traceContent(content: MessageContent): string {
+  if (typeof content === 'string') return content;
+  return content.map((part) => {
+    if (part.type === 'text') return part.text;
+    const url = part.image_url?.url ?? '';
+    const mime = url.startsWith('data:') ? url.slice(5, url.indexOf(';') > 5 ? url.indexOf(';') : undefined) : 'image';
+    return `[IMAGE ${mime || 'image'} — contenu binaire omis de l’inspecteur]`;
+  }).join('\n');
+}
+
+function snapshotMessages(messages: ChatMessage[]) {
+  return messages.map((message) => ({ role: message.role, content: traceContent(message.content) }));
+}
+
+function createTrace(
+  settings: AiSettings,
+  messages: ChatMessage[],
+  options: ChatCompletionOptions,
+  strategy: ReasoningStrategy,
+  attempt: number,
+): AiCallTrace {
+  return {
+    id: traceId(),
+    stage: options.trace?.stage ?? 'appel IA',
+    kind: options.trace?.kind ?? 'other',
+    status: 'prepared',
+    createdAt: new Date().toISOString(),
+    model: settings.model,
+    temperature: options.temperature ?? settings.temperature,
+    thinking: options.thinking,
+    json: Boolean(options.json),
+    reasoningStrategy: strategy,
+    attempt,
+    prompt: snapshotMessages(messages),
+    output: '',
+    reasoning: '',
+    finishReason: null,
+    hadReasoning: false,
+    reasoningChars: 0,
+  };
+}
+
+function emitTrace(options: ChatCompletionOptions, type: AiCallTraceEvent['type'], trace: AiCallTrace) {
+  options.onTrace?.({ type, trace: { ...trace, prompt: trace.prompt.map((message) => ({ ...message })) } });
+}
+
+async function sendChatRequest(
+  settings: AiSettings,
+  payload: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return fetch('/api/openai/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      payload,
+    }),
+    signal,
+  });
+}
+
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => {
+      if (!part || typeof part !== 'object') return '';
+      const candidate = part as { text?: unknown };
+      return typeof candidate.text === 'string' ? candidate.text : '';
+    })
+    .join('');
+}
+
+function extractStreamDelta(payload: StreamPayload): string {
+  const choice = payload.choices?.[0];
+  if (!choice) return '';
+
+  const deltaText = contentToText(choice.delta?.content);
+  if (deltaText) return deltaText;
+
+  // Compatibilité avec certains endpoints qui exposent encore choices[].text.
+  if (typeof choice.text === 'string') return choice.text;
+
+  return '';
+}
+
+async function consumeSseResponse(
+  response: Response,
+  onDelta?: (delta: string, accumulated: string) => void,
+  onReasoningDelta?: (delta: string, accumulated: string) => void,
+): Promise<ChatCompletionResult> {
+  if (!response.body) throw new Error('La réponse de streaming ne contient aucun corps lisible.');
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let dataLines: string[] = [];
+  let accumulated = '';
+  let reasoning = '';
+  let doneMarkerSeen = false;
+  let finishReason: string | null = null;
+  let reasoningChars = 0;
+
+  const emitDataEvent = () => {
+    if (!dataLines.length) return;
+    const data = dataLines.join('\n').trim();
+    dataLines = [];
+    if (!data) return;
+    if (data === '[DONE]') {
+      doneMarkerSeen = true;
+      return;
+    }
+
+    let payload: StreamPayload;
+    try {
+      payload = JSON.parse(data) as StreamPayload;
+    } catch {
+      throw new Error(`Flux SSE OpenAI-compatible invalide: ${data.slice(0, 240)}`);
+    }
+
+    const choice = payload.choices?.[0];
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+
+    if (choice?.delta) {
+      const reasoningDelta = contentToText(choice.delta.reasoning) + contentToText(choice.delta.reasoning_content);
+      if (reasoningDelta) {
+        reasoning += reasoningDelta;
+        reasoningChars += reasoningDelta.length;
+        onReasoningDelta?.(reasoningDelta, reasoning);
+      }
+    }
+
+    const delta = extractStreamDelta(payload);
+    if (!delta) return;
+    accumulated += delta;
+    onDelta?.(delta, accumulated);
+  };
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      emitDataEvent();
+      return;
+    }
+    if (line.startsWith(':')) return; // commentaire/heartbeat SSE
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex = buffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        processLine(buffer.slice(0, newlineIndex));
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf('\n');
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer) processLine(buffer);
+    emitDataEvent();
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!accumulated && !doneMarkerSeen) {
+    throw new Error("Le flux SSE s'est terminé sans contenu de modèle exploitable.");
+  }
+
+  return {
+    content: accumulated,
+    reasoning,
+    finishReason,
+    hadReasoning: reasoningChars > 0,
+    reasoningChars,
+    doneMarkerSeen,
+  };
+}
+
+async function consumeJsonResponse(response: Response): Promise<ChatCompletionResult> {
+  const data = (await response.json()) as StreamPayload;
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content;
+  const text = contentToText(content);
+  if (text) {
+    const reasoningChars = contentToText(choice?.message?.reasoning).length
+      + contentToText(choice?.message?.reasoning_content).length;
+    return {
+      content: text,
+      reasoning: contentToText(choice?.message?.reasoning) + contentToText(choice?.message?.reasoning_content),
+      finishReason: choice?.finish_reason ?? null,
+      hadReasoning: reasoningChars > 0,
+      reasoningChars,
+      doneMarkerSeen: true,
+    };
+  }
+
+  const reasoningChars = contentToText(choice?.message?.reasoning).length
+    + contentToText(choice?.message?.reasoning_content).length;
+  return {
+    content: '',
+    reasoning: contentToText(choice?.message?.reasoning) + contentToText(choice?.message?.reasoning_content),
+    finishReason: choice?.finish_reason ?? null,
+    hadReasoning: reasoningChars > 0,
+    reasoningChars,
+    doneMarkerSeen: true,
+  };
+}
+
+function addReasoningPrompt(messages: ChatMessage[], enabled: boolean): ChatMessage[] {
+  const instruction = reasoningPromptInstruction(enabled);
+  const first = messages[0];
+  if (first?.role === 'system' && typeof first.content === 'string') {
+    return [
+      { ...first, content: `${instruction}\n\n${first.content}` },
+      ...messages.slice(1),
+    ];
+  }
+  return [{ role: 'system', content: instruction }, ...messages];
+}
+
+function isResponseFormatError(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes('response_format')
+    || text.includes('json_object')
+    || text.includes('structured output');
+}
+
+async function sendCompletionWithNegotiation(
+  settings: AiSettings,
+  messages: ChatMessage[],
+  options: ChatCompletionOptions,
+  logicalAttempt: number,
+): Promise<{ response: Response; strategy: ReasoningStrategy; trace: AiCallTrace }> {
+  const strategies = reasoningCandidates(settings, options.thinking);
+  let lastError = '';
+
+  for (let strategyIndex = 0; strategyIndex < strategies.length; strategyIndex += 1) {
+    const strategy = strategies[strategyIndex];
+    let candidateError = '';
+    const effectiveMessages = strategy === 'prompt' && typeof options.thinking === 'boolean'
+      ? addReasoningPrompt(messages, options.thinking)
+      : messages;
+
+    const basePayload: Record<string, unknown> = {
+      model: settings.model,
+      messages: effectiveMessages,
+      temperature: options.temperature ?? settings.temperature,
+      stream: true,
+      ...(typeof options.maxTokens === 'number' ? { max_tokens: options.maxTokens } : {}),
+    };
+
+    if (typeof options.thinking === 'boolean') {
+      applyReasoningPayload(basePayload, strategy, options.thinking);
+    }
+    if (options.json) basePayload.response_format = { type: 'json_object' };
+
+    const performRequest = async (payload: Record<string, unknown>) => {
+      const trace = createTrace(settings, effectiveMessages, options, strategy, logicalAttempt);
+      emitTrace(options, 'prepared', trace);
+      // Rend le snapshot disponible à Vue avant que fetch démarre effectivement.
+      await Promise.resolve();
+      const response = await sendChatRequest(settings, payload, options.signal);
+      return { response, trace };
+    };
+
+    let sent = await performRequest(basePayload);
+
+    if (!sent.response.ok && options.json && (sent.response.status === 400 || sent.response.status === 422)) {
+      const firstError = await readError(sent.response);
+      sent.trace.status = 'error';
+      sent.trace.completedAt = new Date().toISOString();
+      sent.trace.error = firstError;
+      emitTrace(options, 'error', sent.trace);
+
+      if (isResponseFormatError(firstError) || !isReasoningCompatibilityError(firstError, strategy)) {
+        const retryPayload = { ...basePayload };
+        delete retryPayload.response_format;
+        sent = await performRequest(retryPayload);
+      } else {
+        candidateError = firstError;
+      }
+    }
+
+    if (sent.response.ok) return { response: sent.response, strategy, trace: sent.trace };
+
+    const errorMessage = candidateError || await readError(sent.response);
+    if (!sent.trace.error) {
+      sent.trace.status = 'error';
+      sent.trace.completedAt = new Date().toISOString();
+      sent.trace.error = errorMessage;
+      emitTrace(options, 'error', sent.trace);
+    }
+    lastError = errorMessage;
+    const auto = (settings.reasoningStrategy ?? 'auto') === 'auto';
+    const canFallback = auto
+      && strategyIndex < strategies.length - 1
+      && (sent.response.status === 400 || sent.response.status === 422)
+      && isReasoningCompatibilityError(errorMessage, strategy);
+
+    if (canFallback) {
+      rejectReasoningStrategy(settings, strategy);
+      continue;
+    }
+
+    throw new Error(`POST /chat/completions → ${sent.response.status} ${errorMessage}`);
+  }
+
+  throw new Error(`Aucune stratégie de contrôle du raisonnement n'est compatible avec cet endpoint${lastError ? `: ${lastError}` : '.'}`);
+}
+
+export async function chatCompletion(
+  settings: AiSettings,
+  messages: ChatMessage[],
+  options: ChatCompletionOptions = {},
+): Promise<ChatCompletionResult> {
+  const MAX_EMPTY_COMPLETION_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_EMPTY_COMPLETION_ATTEMPTS; attempt += 1) {
+    const retryInstruction = attempt > 1
+      ? options.thinking === false
+        ? `\n\nIMPORTANT — tentative ${attempt}/${MAX_EMPTY_COMPLETION_ATTEMPTS}: la tentative précédente s'est terminée sans produire de réponse finale exploitable. Cette tâche est une exécution déjà planifiée. Produis immédiatement et impérativement la réponse finale demandée dans le champ content.`
+        : `\n\nIMPORTANT — tentative ${attempt}/${MAX_EMPTY_COMPLETION_ATTEMPTS}: la tentative précédente s'est terminée sans produire de réponse finale exploitable. Tu peux effectuer ton raisonnement normalement si nécessaire, mais tu dois impérativement terminer par la réponse finale demandée dans le champ content. Ne termine pas la requête après le seul raisonnement.`
+      : '';
+
+    const attemptMessages: ChatMessage[] = retryInstruction
+      ? [
+          ...messages,
+          {
+            role: 'user',
+            content: retryInstruction.trim(),
+          },
+        ]
+      : messages;
+
+    const { response, strategy, trace } = await sendCompletionWithNegotiation(
+      settings,
+      attemptMessages,
+      options,
+      attempt,
+    );
+
+    const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+    let result: ChatCompletionResult;
+    let lastTraceSize = 0;
+    const tracedDelta = (delta: string, accumulated: string) => {
+      options.onDelta?.(delta, accumulated);
+      trace.status = 'streaming';
+      trace.output = accumulated;
+      if (accumulated.length - lastTraceSize >= 1200) {
+        lastTraceSize = accumulated.length;
+        emitTrace(options, 'streaming', trace);
+      }
+    };
+    let lastReasoningTraceSize = 0;
+    const tracedReasoningDelta = (delta: string, accumulated: string) => {
+      options.onReasoningDelta?.(delta, accumulated);
+      trace.status = 'streaming';
+      trace.reasoning = accumulated;
+      trace.reasoningChars = accumulated.length;
+      if (accumulated.length - lastReasoningTraceSize >= 1200) {
+        lastReasoningTraceSize = accumulated.length;
+        emitTrace(options, 'streaming', trace);
+      }
+    };
+
+    try {
+      if (contentType.includes('text/event-stream')) {
+        result = await consumeSseResponse(response, tracedDelta, tracedReasoningDelta);
+      } else {
+        // Fallback de compatibilité : certains serveurs OpenAI-compatible ignorent
+        // stream=true et renvoient encore une réponse JSON complète.
+        result = await consumeJsonResponse(response);
+        if (result.reasoning) tracedReasoningDelta(result.reasoning, result.reasoning);
+        if (result.content) tracedDelta(result.content, result.content);
+      }
+    } catch (error) {
+      trace.status = 'error';
+      trace.completedAt = new Date().toISOString();
+      trace.error = error instanceof Error ? error.message : String(error);
+      emitTrace(options, 'error', trace);
+      throw error;
+    }
+
+    result.reasoningStrategy = strategy;
+    trace.output = result.content;
+    trace.reasoning = result.reasoning;
+    trace.finishReason = result.finishReason;
+    trace.hadReasoning = result.hadReasoning;
+    trace.reasoningChars = result.reasoningChars;
+    trace.reasoningStrategy = strategy;
+    trace.completedAt = new Date().toISOString();
+
+    // En mode auto, une stratégie acceptée par HTTP peut tout de même être ignorée
+    // silencieusement par certains proxies. Si on demandait explicitement de ne pas
+    // raisonner mais que des chunks reasoning sont quand même présents, on évite de
+    // mémoriser cette stratégie pour les prochains fichiers.
+    if (options.thinking === false && result.hadReasoning && (settings.reasoningStrategy ?? 'auto') === 'auto') {
+      rejectReasoningStrategy(settings, strategy);
+    } else {
+      rememberReasoningStrategy(settings, strategy);
+    }
+
+    if (result.content.trim()) {
+      trace.status = 'done';
+      emitTrace(options, 'done', trace);
+      return result;
+    }
+
+    const emptyReason = result.hadReasoning
+      ? `${result.reasoningChars.toLocaleString('fr-FR')} caractères de reasoning sans content`
+      : 'réponse vide sans content';
+    trace.status = 'error';
+    trace.error = attempt < MAX_EMPTY_COMPLETION_ATTEMPTS
+      ? `${emptyReason}; nouvelle tentative automatique.`
+      : `${emptyReason}; aucune réponse exploitable après ${MAX_EMPTY_COMPLETION_ATTEMPTS} tentatives.`;
+    emitTrace(options, 'error', trace);
+
+    if (attempt < MAX_EMPTY_COMPLETION_ATTEMPTS) {
+      options.onRetry?.({
+        attempt: attempt + 1,
+        maxAttempts: MAX_EMPTY_COMPLETION_ATTEMPTS,
+        hadReasoning: result.hadReasoning,
+        reasoningChars: result.reasoningChars,
+        finishReason: result.finishReason,
+        doneMarkerSeen: result.doneMarkerSeen,
+      });
+      continue;
+    }
+
+    const reason = result.hadReasoning
+      ? `Le modèle a produit ${result.reasoningChars.toLocaleString('fr-FR')} caractères de reasoning mais aucune réponse finale`
+      : 'Le modèle n\'a produit ni reasoning exploitable ni réponse finale';
+    const finish = result.finishReason ? `, finish_reason=${result.finishReason}` : '';
+    const done = result.doneMarkerSeen ? ', stream terminé par [DONE]' : '';
+    throw new Error(
+      `${reason}${finish}${done}, après ${MAX_EMPTY_COMPLETION_ATTEMPTS} tentatives.`,
+    );
+  }
+
+  throw new Error('La génération IA s\'est terminée sans résultat exploitable.');
+}
+
+export function parseJsonResponse<T>(raw: string): T {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1];
+  const candidate = fenced ?? trimmed;
+  try {
+    return JSON.parse(candidate) as T;
+  } catch {
+    const first = candidate.indexOf('{');
+    const last = candidate.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+      return JSON.parse(candidate.slice(first, last + 1)) as T;
+    }
+    throw new Error("Le modèle n'a pas renvoyé un JSON valide.");
+  }
+}

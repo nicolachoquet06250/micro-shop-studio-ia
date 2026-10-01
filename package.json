@@ -1,0 +1,32 @@
+{
+  "name": "micro-shop-generator",
+  "type": "module",
+  "version": "0.0.1",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "start": "node ./dist/server/entry.mjs"
+  },
+  "dependencies": {
+    "astro": "^7.3.5",
+    "@astrojs/vue": "7.0.3",
+    "vue": "3.5.43",
+    "pinia": "4.0.3",
+    "jszip": "3.10.2",
+    "@vue/devtools-api": "8.2.1",
+    "@astrojs/node": "11.1.6",
+    "mermaid": "12.0.0",
+    "@webcontainer/api": "1.6.4",
+    "@php-wasm/web-8-4": "3.1.56",
+    "@php-wasm/universal": "3.1.56",
+    "@wasmer/sdk": "0.19.0"
+  },
+  "allowScripts": {
+    "esbuild": true
+  }
+}

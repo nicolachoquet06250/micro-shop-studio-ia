@@ -1,0 +1,3 @@
+[submodule "src/ai-network"]
+	path = src/ai-network
+	url = https://github.com/nicolachoquet06250/micro-shop-agents-network.git
