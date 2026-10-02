@@ -5,6 +5,8 @@ import { buildNetworkManifest, embeddedNetworkFiles, networkContext } from './ne
 import { buildProjectInput } from './projectInput';
 import { reasoningCandidates, reasoningPromptInstruction } from './reasoning';
 import { ContextLedgerStore, fitMessagesToContext } from './contextBudget';
+import { detectDegeneration } from './generationGuard';
+import { chunkKeys, extractI18nKeyRegistry, nestedCatalog, partitionTranslations, renderCatalogFile, renderStructuredCatalogFile } from './i18nFinalizer';
 
 export interface GenerationStreamEvent {
   stage: string;
@@ -31,6 +33,29 @@ interface AbandonedStepRecord {
 
 interface GenerationNetworkState {
   abandonedSteps: AbandonedStepRecord[];
+}
+
+interface GenerationHealthEvent {
+  at: string;
+  stage: string;
+  kind: 'analysis' | 'file' | 'translation';
+  target?: string;
+  fragment?: number;
+  recoveryAttempt: number;
+  status: 'detected' | 'recovered' | 'failed';
+  reasonCode: string;
+  reason: string;
+  sample?: string;
+  generatedChars: number;
+  checkpointChars: number;
+}
+
+interface GenerationHealthReport {
+  version: 1;
+  automaticRecoveries: number;
+  detections: number;
+  failures: number;
+  events: GenerationHealthEvent[];
 }
 
 export class GenerationStepController {
@@ -90,6 +115,7 @@ interface GenerateCallbacks {
   onStepState?: (state: GenerationStepState) => void;
   stepController?: GenerationStepController;
   generationState?: GenerationNetworkState;
+  generationHealth?: GenerationHealthReport;
   contextLedger?: ContextLedgerStore;
   signal?: AbortSignal;
 }
@@ -170,6 +196,86 @@ interface ExistingRepositoryContext {
 
 const CORE = 'skills/micro-shop-core-rules/SKILL.md';
 
+const IMPORT_API_USER_RULES = [
+  '===== RÈGLES IMPÉRATIVES D’IMPORTS ET D’API =====',
+  'Avant d’écrire le moindre import, renseigne-toi d’abord sur le package EXACT, son sous-package, son dialecte et, lorsqu’elle est disponible dans le contexte, sa version.',
+  'Tu dois importer UNIQUEMENT des symboles réellement exportés par le module exact indiqué dans la clause import.',
+  'Vérifie chaque symbole importé à partir des éléments disponibles : TECH_STACK, package.json/lockfile, fichiers existants, types/signatures déjà présents, documentation fournie dans le contexte et connaissance fiable de l’API du package.',
+  'N’invente jamais un export et ne transpose jamais un symbole provenant d’un package voisin, d’un autre dialecte, adapter, runtime, framework ou sous-package.',
+  'Une API qui existe dans une autre variante d’une bibliothèque n’est PAS réputée exister dans le module ciblé.',
+  'En cas de doute sur l’existence d’un symbole, ne fais aucun import spéculatif : utilise uniquement une API dont la présence dans le package ciblé est établie par le contexte ou une connaissance fiable.',
+  'Avant de finaliser le fichier, relis tous les imports et contrôle explicitement la cohérence package ↔ symbole ↔ dialecte ↔ version ↔ usage.',
+  'Exemple interdit : importer `pgTable` depuis `drizzle-orm/mysql-core` sous prétexte que `pgTable` existe dans Drizzle ; `pgTable` appartient au dialecte PostgreSQL.',
+  'Pour Nuxt/Nitro, ne considère JAMAIS qu’un symbole est disponible via `#imports`, `#app`, `nuxt/app`, `h3` ou un alias virtuel simplement parce qu’un nom similaire existe dans l’écosystème. Vérifie qu’il est réellement exporté/auto-importé par la version utilisée.',
+  'Exemple interdit : importer ou auto-importer `getRoutePath` depuis `#imports` sans preuve que cette version de Nuxt/Nitro l’expose.',
+  '===== FIN RÈGLES D’IMPORTS ET D’API =====',
+].join('\n');
+
+function buildStackImportContract(techStack: unknown, path: string): string {
+  const stack = stableJson(techStack).toLowerCase();
+  const rules: string[] = [IMPORT_API_USER_RULES];
+
+  if (stack.includes('drizzle')) {
+    const mysql = stack.includes('mysql') || stack.includes('mariadb');
+    const postgres = stack.includes('postgresql') || stack.includes('postgres') || stack.includes('pg-core');
+    const sqlite = stack.includes('sqlite');
+    const dialectCount = [mysql, postgres, sqlite].filter(Boolean).length;
+
+    if (dialectCount > 1) {
+      rules.push([
+        '===== CONTRAT DRIZZLE MULTI-DIALECTE =====',
+        'Plusieurs moteurs sont présents dans la stack : détermine d’abord le dialecte réellement ciblé par CE fichier à partir de son chemin, du BUILD_PLAN, de TECH_STACK et des fichiers de contexte.',
+        'Si le module importé est `drizzle-orm/mysql-core`, utilise uniquement ses exports réels ; la factory de table est `mysqlTable` et `pgTable`/`sqliteTable` y sont interdits.',
+        'Si le module importé est `drizzle-orm/pg-core`, utilise uniquement ses exports réels ; la factory de table est `pgTable` et `mysqlTable`/`sqliteTable` y sont interdits.',
+        'Si le module importé est `drizzle-orm/sqlite-core`, utilise uniquement ses exports réels ; la factory de table est `sqliteTable` et `pgTable`/`mysqlTable` y sont interdits.',
+        'Ne mélange jamais dans un même fichier physique des primitives provenant de dialectes Drizzle différents.',
+        '===== FIN CONTRAT DRIZZLE MULTI-DIALECTE =====',
+      ].join('\n'));
+    } else if (mysql) {
+      rules.push([
+        '===== CONTRAT DRIZZLE MYSQL/MARIADB =====',
+        'Le dialecte Drizzle ciblé est MySQL/MariaDB.',
+        'Pour les schémas Drizzle MySQL/MariaDB, utilise les exports réellement disponibles dans `drizzle-orm/mysql-core` et notamment `mysqlTable` pour déclarer une table.',
+        'N’utilise jamais `pgTable`, `pgEnum`, `serial`, `bigserial` ni aucun helper spécifique PostgreSQL dans un fichier MySQL/MariaDB.',
+        'N’importe rien depuis `drizzle-orm/pg-core` pour implémenter ce dialecte.',
+        'Ne remplace pas mécaniquement un helper par un nom supposé : vérifie que chaque helper/type utilisé existe réellement dans `drizzle-orm/mysql-core`.',
+        '===== FIN CONTRAT DRIZZLE MYSQL/MARIADB =====',
+      ].join('\n'));
+    } else if (postgres) {
+      rules.push([
+        '===== CONTRAT DRIZZLE POSTGRESQL =====',
+        'Le dialecte Drizzle ciblé est PostgreSQL.',
+        'Pour les schémas Drizzle PostgreSQL, utilise uniquement les exports réellement disponibles dans `drizzle-orm/pg-core` et `pgTable` pour déclarer une table.',
+        'N’utilise pas `mysqlTable` ni les helpers spécifiques MySQL/MariaDB ou SQLite.',
+        '===== FIN CONTRAT DRIZZLE POSTGRESQL =====',
+      ].join('\n'));
+    } else if (sqlite) {
+      rules.push([
+        '===== CONTRAT DRIZZLE SQLITE =====',
+        'Le dialecte Drizzle ciblé est SQLite.',
+        'Pour les schémas Drizzle SQLite, utilise uniquement les exports réellement disponibles dans `drizzle-orm/sqlite-core` et `sqliteTable` pour déclarer une table.',
+        'N’utilise pas `pgTable` ni `mysqlTable`.',
+        '===== FIN CONTRAT DRIZZLE SQLITE =====',
+      ].join('\n'));
+    }
+  }
+
+  if (stack.includes('nuxt') || stack.includes('nitro')) {
+    rules.push([
+      '===== CONTRAT NUXT / NITRO / AUTO-IMPORTS =====',
+      'La stack utilise Nuxt/Nitro : les aliases virtuels et auto-imports sont versionnés et ne doivent jamais être devinés.',
+      'Avant d’utiliser `#imports`, `#app`, `nuxt/app`, `h3` ou un module Nuxt, vérifie que le symbole exact est réellement disponible dans la version déclarée par package.json/lockfile et cohérent avec le contexte serveur/client du fichier.',
+      'N’invente aucun auto-import Nuxt/Nitro et ne transpose pas une API issue d’une autre version, d’un module optionnel ou d’un exemple communautaire.',
+      'Si une API n’est pas établie, préfère une primitive standard ou une API explicitement présente dans les dépendances/fichiers existants plutôt qu’un symbole supposé de `#imports`.',
+      'Interdit notamment : `getRoutePath` depuis `#imports` si son export n’est pas établi par la stack courante.',
+      '===== FIN CONTRAT NUXT / NITRO / AUTO-IMPORTS =====',
+    ].join('\n'));
+  }
+
+  rules.push(`Fichier concerné par ce contrôle d’imports : ${path}`);
+  return `\n\n${rules.join('\n\n')}\n`;
+}
+
 function nowId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -223,6 +329,19 @@ function markStepAbandoned(callbacks: GenerateCallbacks, stage: string, kind: Ab
   callbacks.generationState.abandonedSteps.push({ stage, at: new Date().toISOString(), kind, target });
 }
 
+function ensureGenerationHealth(callbacks: GenerateCallbacks): GenerationHealthReport {
+  callbacks.generationHealth ??= { version: 1, automaticRecoveries: 0, detections: 0, failures: 0, events: [] };
+  return callbacks.generationHealth;
+}
+
+function recordGenerationHealth(callbacks: GenerateCallbacks, event: Omit<GenerationHealthEvent, 'at'>): void {
+  const report = ensureGenerationHealth(callbacks);
+  report.events.push({ ...event, at: new Date().toISOString() });
+  if (event.status === 'detected') report.detections += 1;
+  if (event.status === 'recovered') report.automaticRecoveries += 1;
+  if (event.status === 'failed') report.failures += 1;
+}
+
 function beginControlledStep(callbacks: GenerateCallbacks, stage: string): AbortSignal | undefined {
   if (!callbacks.stepController) return callbacks.signal;
   const signal = callbacks.stepController.begin(stage, callbacks.signal);
@@ -255,7 +374,8 @@ function buildI18nApplicationContext(form: GeneratorForm): I18nApplicationContex
           'Les libellés concernés incluent navigation, boutons, labels, placeholders, validations, erreurs, toasts, états vides, textes d’aide, métadonnées SEO statiques et contenus statiques des e-mails transactionnels.',
           'Les contenus métier dynamiques provenant de la base de données ou saisis par les utilisateurs ne sont pas des wordings statiques et ne doivent pas être remplacés artificiellement par des clés.',
           'Chaque clé de traduction doit disposer d’une traduction réelle dans chacune des langues sélectionnées ; aucune langue ne peut dépendre d’un fallback pour compenser une clé manquante.',
-          'Les catalogues de traduction de toutes les langues doivent avoir le même ensemble de clés.',
+          'Les catalogues de traduction sont générés dans une phase finale après tout le code applicatif : pendant la génération des pages, composants, routes API et services, utilise uniquement des clés i18n stables et hiérarchiques, idéalement avec au moins un point.',
+          'Les catalogues de traduction de toutes les langues doivent avoir le même ensemble de clés, extrait des usages réels du code généré.',
           'La configuration i18n, le routage/localisation et les tests doivent être cohérents avec le framework réellement choisi dans TECH_STACK.',
         ]
       : [],
@@ -350,6 +470,9 @@ function i18nPromptRules(context: I18nApplicationContext): string {
     'INTERNATIONALISATION: OBLIGATOIRE.',
     `Langues exactes sélectionnées: ${stableJson(context.locales)}.`,
     `Langue par défaut applicative: ${context.defaultLocale ?? '(aucune)'}.`,
+    '- SOURCE DE VÉRITÉ DES CLÉS: les clés i18n finales doivent être EXACTEMENT celles réellement référencées dans les fichiers source de l’application générée. La phase i18n finale les extrait déterministiquement du code ; n’invente, ne renomme, ne fusionne et ne supprime aucune clé.',
+    '- PARITÉ ABSOLUE: chaque locale doit contenir EXACTEMENT le même ensemble complet de clés que cette liste canonique extraite des sources. Aucune langue ne peut avoir une clé en plus ou en moins.',
+    '- FICHIERS DE TRADUCTION: utilise exactement un fichier de ressources distinct par locale. Chaque fichier de traduction doit contenir individuellement le jeu COMPLET des clés canoniques extraites des sources. Aucun fichier partagé entre plusieurs locales, aucune partition de clés entre plusieurs fichiers.',
     ...context.requirements.map((rule) => `- ${rule}`),
   ].join('\n');
 }
@@ -365,14 +488,27 @@ function assertI18nBuildPlan(plan: BuildPlan, context: I18nApplicationContext) {
   const missing = context.locales.filter((locale) => !declared.has(locale));
   const unexpected = [...declared.keys()].filter((locale) => !context.locales.includes(locale));
   const withoutResources = context.locales.filter((locale) => !(declared.get(locale)?.resourceFiles?.length));
+  const invalidResourceCount = context.locales.filter((locale) => (declared.get(locale)?.resourceFiles?.length ?? 0) !== 1);
+  const resourceOwners = new Map<string, string[]>();
+  for (const locale of context.locales) {
+    const rawPath = declared.get(locale)?.resourceFiles?.[0];
+    const path = rawPath ? sanitizeGeneratedPath(rawPath) : '';
+    if (!path) continue;
+    const owners = resourceOwners.get(path) ?? [];
+    owners.push(locale);
+    resourceOwners.set(path, owners);
+  }
+  const sharedResourcePaths = [...resourceOwners.entries()].filter(([, owners]) => owners.length > 1);
 
   const wrongDefaultLocale = declaredDefaultLocale !== context.defaultLocale;
 
-  if (missing.length || unexpected.length || withoutResources.length || wrongDefaultLocale) {
+  if (missing.length || unexpected.length || withoutResources.length || invalidResourceCount.length || sharedResourcePaths.length || wrongDefaultLocale) {
     const details = [
       missing.length ? `langues absentes: ${missing.join(', ')}` : '',
       unexpected.length ? `langues non demandées: ${unexpected.join(', ')}` : '',
       withoutResources.length ? `catalogue non déclaré: ${withoutResources.join(', ')}` : '',
+      invalidResourceCount.length ? `un fichier de traduction unique est requis par locale: ${invalidResourceCount.join(', ')}` : '',
+      sharedResourcePaths.length ? `un même fichier ne peut pas être partagé par plusieurs locales: ${sharedResourcePaths.map(([path, owners]) => `${path} (${owners.join(', ')})`).join(' ; ')}` : '',
       wrongDefaultLocale ? `langue par défaut incorrecte: ${declaredDefaultLocale ?? '(absente)'} au lieu de ${context.defaultLocale}` : '',
     ].filter(Boolean).join(' ; ');
     throw new Error(`BUILD_PLAN i18n incomplet (${details}).`);
@@ -395,20 +531,233 @@ function assertGeneratedI18nResources(plan: BuildPlan, context: I18nApplicationC
   }
 }
 
-function assertI18nResourcesScheduled(plan: BuildPlan, context: I18nApplicationContext, batches: BuildBatch[]) {
-  if (!context.enabled || !plan.i18n) return;
-  const scheduled = new Set(
-    batches.flatMap((batch) => batch.files.map((path) => sanitizeGeneratedPath(path)).filter((path): path is string => Boolean(path))),
+interface TranslationBatchResult {
+  translations?: Record<string, unknown>;
+}
+
+function declaredI18nResourcePaths(plan: BuildPlan, context: I18nApplicationContext): Set<string> {
+  if (!context.enabled || !plan.i18n) return new Set();
+  return new Set(
+    (plan.i18n.locales ?? [])
+      .flatMap((locale) => locale.resourceFiles ?? [])
+      .map((path) => sanitizeGeneratedPath(path))
+      .filter((path): path is string => Boolean(path)),
   );
-  const missing = new Set<string>();
-  for (const locale of plan.i18n.locales ?? []) {
-    for (const resourcePath of locale.resourceFiles ?? []) {
-      const path = sanitizeGeneratedPath(resourcePath);
-      if (!path || !scheduled.has(path)) missing.add(resourcePath);
+}
+
+function exactTranslationMap(
+  payload: TranslationBatchResult,
+  expectedKeys: string[],
+): { ok: true; translations: Record<string, string> } | { ok: false; reason: string } {
+  const raw = payload?.translations;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, reason: 'champ translations absent ou invalide' };
+  }
+
+  const entries = Object.entries(raw);
+  const invalidValues = entries.filter(([, value]) => typeof value !== 'string').map(([key]) => key);
+  if (invalidValues.length) return { ok: false, reason: `valeurs non textuelles: ${invalidValues.slice(0, 6).join(', ')}` };
+
+  const actualKeys = entries.map(([key]) => key).sort();
+  const expected = [...expectedKeys].sort();
+  const missing = expected.filter((key) => !actualKeys.includes(key));
+  const extra = actualKeys.filter((key) => !expected.includes(key));
+  if (missing.length || extra.length) {
+    const details = [
+      missing.length ? `manquantes: ${missing.slice(0, 8).join(', ')}` : '',
+      extra.length ? `supplémentaires: ${extra.slice(0, 8).join(', ')}` : '',
+    ].filter(Boolean).join(' ; ');
+    return { ok: false, reason: details };
+  }
+
+  const translations = Object.fromEntries(entries.map(([key, value]) => [key, value as string]));
+  const degeneration = detectDegeneration(stableJson(translations));
+  if (degeneration) return { ok: false, reason: `dégénérescence détectée: ${degeneration.reason}` };
+  return { ok: true, translations };
+}
+
+function translationUsageContext(
+  keys: string[],
+  usages: Record<string, Array<{ path: string; line: number; excerpt: string }>>,
+): string {
+  const compact = Object.fromEntries(keys.map((key) => [key, (usages[key] ?? []).slice(0, 3)]));
+  return stableJson(compact);
+}
+
+async function generateTranslationBatch(
+  settings: AiSettings,
+  locale: string,
+  keys: string[],
+  usages: Record<string, Array<{ path: string; line: number; excerpt: string }>>,
+  callbacks: GenerateCallbacks,
+  stage: string,
+): Promise<Record<string, string> | null> {
+  let lastReason = '';
+  let hadDegenerationRejection = false;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    assertNotAborted(callbacks.signal);
+    const retryRule = lastReason
+      ? `\nLa tentative précédente a été rejetée par le validateur déterministe: ${lastReason}. Corrige exactement ce problème.`
+      : '';
+    const result = await callJson<TranslationBatchResult>(
+      settings,
+      ['agents/09-micro-shop-implementation-orchestrator.agent.md', 'agents/10a-micro-shop-frontoffice-builder.agent.md'],
+      `Traduis EXACTEMENT les clés i18n suivantes vers la locale « ${locale} ».\n` +
+      `Retourne strictement {"translations":{"cle":"traduction"}}.\n` +
+      `Règles impératives:\n` +
+      `- les CLÉS ATTENDUES ci-dessous sont la liste canonique extraite déterministiquement des fichiers source de l’application : ce sont les mêmes clés que celles réellement utilisées dans le code ;\n` +
+      `- l'ensemble des clés de translations doit être EXACTEMENT celui fourni ci-dessous ;\n` +
+      `- toutes les autres locales sont générées à partir de cette même liste canonique : chaque fichier de traduction de chaque langue doit donc contenir EXACTEMENT les mêmes clés ; seules les valeurs traduites changent ;\n` +
+      `- aucune clé ajoutée, supprimée, renommée ou inventée ;\n` +
+      `- une seule traduction par clé, texte naturel pour la locale ${locale} ;\n` +
+      `- préserve strictement tous les placeholders/interpolations visibles dans les extraits d'usage ({name}, {{name}}, :name, %s, etc.) ;\n` +
+      `- n'invente jamais de séries numériques, variantes artificielles ou familles de clés ;\n` +
+      `- ne traduis pas les clés elles-mêmes.\n` +
+      `CLÉS ATTENDUES:\n${stableJson(keys)}\n\n` +
+      `CONTEXTE D'USAGE PAR CLÉ:\n${translationUsageContext(keys, usages)}${retryRule}`,
+      callbacks,
+      stage,
+    );
+
+    if (isAbandonedArtifact(result)) return null;
+    const checked = exactTranslationMap(result, keys);
+    if ('reason' in checked) {
+      lastReason = checked.reason;
+      if (lastReason.startsWith('dégénérescence détectée:')) {
+        hadDegenerationRejection = true;
+        recordGenerationHealth(callbacks, {
+          stage, kind: 'translation', target: locale, recoveryAttempt: attempt, status: 'detected',
+          reasonCode: 'translation-degeneration', reason: lastReason, generatedChars: stableJson(result).length, checkpointChars: 0,
+        });
+      }
+      if (attempt < 3) emit(callbacks, stage, 'info', `Lot de traduction rejeté (${lastReason}). Nouvelle tentative ${attempt + 1}/3.`);
+      continue;
+    }
+    if (hadDegenerationRejection) {
+      recordGenerationHealth(callbacks, {
+        stage, kind: 'translation', target: locale, recoveryAttempt: attempt - 1, status: 'recovered',
+        reasonCode: 'automatic-recovery', reason: 'Le lot i18n régénéré respecte les clés attendues et ne présente plus de dégénérescence.',
+        generatedChars: stableJson(checked.translations).length, checkpointChars: stableJson(checked.translations).length,
+      });
+    }
+    return checked.translations;
+  }
+
+  throw new Error(`${stage}: impossible d'obtenir un lot de traduction strictement valide après 3 tentatives (${lastReason}).`);
+}
+
+async function generateFinalI18nResources(
+  settings: AiSettings,
+  plan: BuildPlan,
+  context: I18nApplicationContext,
+  files: Map<string, string>,
+  binaryFiles: Map<string, string>,
+  callbacks: GenerateCallbacks,
+): Promise<void> {
+  if (!context.enabled || !plan.i18n) return;
+
+  const resourcePaths = declaredI18nResourcePaths(plan, context);
+  emit(callbacks, 'i18n final', 'running', 'Extraction déterministe des clés i18n après génération du code…');
+  const registry = extractI18nKeyRegistry(files, resourcePaths);
+  files.set('.ai/i18n/keys.json', stableJson(registry.keys));
+  files.set('.ai/i18n/usages.json', stableJson(registry.usages));
+
+  if (!registry.keys.length) {
+    emit(callbacks, 'i18n final', 'info', 'Aucune clé i18n exploitable détectée dans le code généré ; des catalogues vides seront produits.');
+  } else {
+    emit(callbacks, 'i18n final', 'info', `${registry.keys.length} clé(s) i18n unique(s) détectée(s). Génération des traductions en lots bornés.`);
+  }
+
+  const localeTranslations = new Map<string, Record<string, string>>();
+  const localePartitions = new Map<string, Map<string, Record<string, string>>>();
+  const localePlans = new Map((plan.i18n.locales ?? []).map((locale) => [locale.code.toLowerCase(), locale]));
+
+  for (const [localeIndex, locale] of context.locales.entries()) {
+    const localePlan = localePlans.get(locale);
+    if (!localePlan) throw new Error(`Plan i18n absent pour la locale ${locale}.`);
+    const chunks = chunkKeys(registry.keys, 80);
+    const translations: Record<string, string> = {};
+
+    for (const [chunkIndex, keys] of chunks.entries()) {
+      const stage = `i18n ${locale} · ${chunkIndex + 1}/${chunks.length}`;
+      const translated = await generateTranslationBatch(settings, locale, keys, registry.usages, callbacks, stage);
+      if (translated === null) {
+        emit(callbacks, stage, 'error', `Lot i18n ${locale} abandonné. La locale restera incomplète mais la génération poursuit.`);
+        continue;
+      }
+      Object.assign(translations, translated);
+    }
+
+    const missing = registry.keys.filter((key) => !(key in translations));
+    if (missing.length) {
+      emit(callbacks, `i18n ${locale}`, 'error', `${missing.length} clé(s) non traduite(s) après abandon/échec: ${missing.slice(0, 8).join(', ')}`);
+    }
+    localeTranslations.set(locale, translations);
+    localePartitions.set(locale, partitionTranslations(localePlan.resourceFiles.map((path) => sanitizeGeneratedPath(path)).filter((path): path is string => Boolean(path)), translations));
+    emit(callbacks, 'i18n final', 'info', `Locale ${locale} préparée (${localeIndex + 1}/${context.locales.length}).`);
+  }
+
+  const pathOwners = new Map<string, string[]>();
+  for (const locale of context.locales) {
+    const localePlan = localePlans.get(locale);
+    for (const rawPath of localePlan?.resourceFiles ?? []) {
+      const path = sanitizeGeneratedPath(rawPath);
+      if (!path) continue;
+      const owners = pathOwners.get(path) ?? [];
+      if (!owners.includes(locale)) owners.push(locale);
+      pathOwners.set(path, owners);
     }
   }
-  if (missing.size) {
-    throw new Error(`Le BUILD_PLAN déclare des ressources i18n hors des lots réellement exécutés: ${[...missing].join(', ')}`);
+
+  for (const [path, owners] of pathOwners) {
+    const existing = files.get(path) ?? '';
+    let content: string;
+    if (owners.length === 1) {
+      const translations = localePartitions.get(owners[0])?.get(path) ?? {};
+      content = renderCatalogFile(path, translations, existing);
+    } else if (path.toLowerCase().endsWith('.properties')) {
+      const flattened: Record<string, string> = {};
+      for (const locale of owners) {
+        const translations = localePartitions.get(locale)?.get(path) ?? localeTranslations.get(locale) ?? {};
+        for (const [key, value] of Object.entries(translations)) flattened[`${locale}.${key}`] = value;
+      }
+      content = renderCatalogFile(path, flattened, existing);
+    } else {
+      const payload: Record<string, unknown> = {};
+      for (const locale of owners) {
+        const translations = localePartitions.get(locale)?.get(path) ?? localeTranslations.get(locale) ?? {};
+        payload[locale] = nestedCatalog(translations);
+      }
+      content = renderStructuredCatalogFile(path, payload, existing);
+    }
+    files.set(path, content);
+    binaryFiles.delete(path);
+  }
+
+  const parity = Object.fromEntries(context.locales.map((locale) => {
+    const translations = localeTranslations.get(locale) ?? {};
+    const missing = registry.keys.filter((key) => !(key in translations));
+    const extra = Object.keys(translations).filter((key) => !registry.keys.includes(key));
+    return [locale, { translated: Object.keys(translations).length, missing, extra }];
+  }));
+  files.set('.ai/i18n/report.json', stableJson({
+    generatedAt: new Date().toISOString(),
+    canonicalKeySource: 'generated-application-source-files',
+    canonicalKeysFile: '.ai/i18n/keys.json',
+    invariant: 'Chaque fichier de traduction doit contenir exactement le même ensemble complet de clés que les clés réellement utilisées dans les fichiers source de l’application.',
+    defaultLocale: context.defaultLocale,
+    locales: context.locales,
+    keyCount: registry.keys.length,
+    resourceFiles: [...resourcePaths].sort(),
+    allLocalesExactKeyParity: Object.values(parity).every((value) => value.missing.length === 0 && value.extra.length === 0),
+    parity,
+  }));
+
+  const invalid = Object.entries(parity).filter(([, value]) => value.missing.length || value.extra.length);
+  if (invalid.length) {
+    emit(callbacks, 'i18n final', 'error', `Parité i18n incomplète pour ${invalid.map(([locale]) => locale).join(', ')}. Le rapport .ai/i18n/report.json détaille les écarts.`);
+  } else {
+    emit(callbacks, 'i18n final', 'done', `Catalogues i18n générés en dernière phase avec parité stricte sur ${registry.keys.length} clé(s).`);
   }
 }
 
@@ -479,6 +828,8 @@ export function buildInitialPromptPreview(form: GeneratorForm, settings: AiSetti
   };
 }
 
+const STEP_DEGENERATION_MAX_RECOVERIES = 3;
+
 async function callJson<T>(
   settings: AiSettings,
   systemPaths: string[],
@@ -488,28 +839,54 @@ async function callJson<T>(
   images: Array<{ mimeType: string; dataUrl: string; name: string }> = [],
 ): Promise<T> {
   assertNotAborted(callbacks.signal);
-  const messages = buildJsonMessages(systemPaths, `${userContent}${generationStateMessage(callbacks)}`, images);
+  const baseMessages = buildJsonMessages(systemPaths, `${userContent}${generationStateMessage(callbacks)}`, images);
+  let messages = baseMessages;
+  let recoveryAttempts = 0;
 
   while (true) {
-    emit(callbacks, stage, 'running', `Appel de ${stage}…`);
+    emit(callbacks, stage, 'running', recoveryAttempts
+      ? `Récupération automatique de ${stage} (${recoveryAttempts}/${STEP_DEGENERATION_MAX_RECOVERIES})…`
+      : `Appel de ${stage}…`);
     callbacks.onStream?.({ stage, phase: 'start', receivedChars: 0 });
     const stepSignal = beginControlledStep(callbacks, stage);
+    const guardController = new AbortController();
+    let detachStepSignal: (() => void) | null = null;
+    if (stepSignal) {
+      const forwardAbort = () => guardController.abort(stepSignal.reason);
+      if (stepSignal.aborted) forwardAbort();
+      else {
+        stepSignal.addEventListener('abort', forwardAbort, { once: true });
+        detachStepSignal = () => stepSignal.removeEventListener('abort', forwardAbort);
+      }
+    }
+
+    let degenerationFinding: ReturnType<typeof detectDegeneration> = null;
+    let lastGuardCheckLength = 0;
+    const traceStage = recoveryAttempts ? `${stage} · récupération ${recoveryAttempts}/${STEP_DEGENERATION_MAX_RECOVERIES}` : stage;
 
     try {
       callbacks.contextLedger ??= new ContextLedgerStore();
-      const fittedMessages = await fitMessagesToContext(settings, messages, stage, callbacks.contextLedger, {
-        signal: stepSignal,
+      const fittedMessages = await fitMessagesToContext(settings, messages, traceStage, callbacks.contextLedger, {
+        signal: guardController.signal,
         onTrace: callbacks.onAiTrace,
         onInfo: (message) => emit(callbacks, stage, 'info', message),
       });
       const result = await chatCompletion(settings, fittedMessages, {
         json: true,
         thinking: true,
-        signal: stepSignal,
-        trace: { stage, kind: 'json' },
+        signal: guardController.signal,
+        trace: { stage: traceStage, kind: 'json' },
         onTrace: callbacks.onAiTrace,
         onDelta(delta, accumulated) {
           callbacks.onStream?.({ stage, phase: 'delta', delta, receivedChars: accumulated.length });
+          if (!degenerationFinding && accumulated.length - lastGuardCheckLength >= 1_200) {
+            lastGuardCheckLength = accumulated.length;
+            const finding = detectDegeneration(accumulated);
+            if (finding) {
+              degenerationFinding = finding;
+              guardController.abort('DEGENERATION_DETECTED');
+            }
+          }
         },
         onReasoningDelta(delta, accumulated) {
           callbacks.onStream?.({
@@ -528,17 +905,75 @@ async function callJson<T>(
         },
       });
 
+      const completedFinding = detectDegeneration(result.content);
+      if (completedFinding) {
+        degenerationFinding = completedFinding;
+        throw new Error('DEGENERATION_DETECTED_AFTER_STREAM');
+      }
+
       if (result.finishReason === 'length') {
         throw new Error(`${stage} a atteint la limite de sortie du modèle (finish_reason=length) après ${result.content.length} caractères.`);
       }
       const parsed = parseJsonResponse<T>(result.content);
+      if (recoveryAttempts > 0) {
+        recordGenerationHealth(callbacks, {
+          stage,
+          kind: 'analysis',
+          recoveryAttempt: recoveryAttempts,
+          status: 'recovered',
+          reasonCode: 'automatic-recovery',
+          reason: 'La nouvelle tentative a produit une sortie saine et exploitable.',
+          generatedChars: result.content.length,
+          checkpointChars: result.content.length,
+        });
+        emit(callbacks, stage, 'info', `${stage} : récupération automatique réussie après ${recoveryAttempts} tentative(s).`);
+      }
       callbacks.onStream?.({ stage, phase: 'done', receivedChars: result.content.length });
       emit(callbacks, stage, 'done', `${stage} terminé.`);
       return parsed;
     } catch (error) {
+      if (degenerationFinding) {
+        recoveryAttempts += 1;
+        recordGenerationHealth(callbacks, {
+          stage,
+          kind: 'analysis',
+          recoveryAttempt: recoveryAttempts,
+          status: 'detected',
+          reasonCode: degenerationFinding.code,
+          reason: degenerationFinding.reason,
+          sample: degenerationFinding.sample,
+          generatedChars: lastGuardCheckLength,
+          checkpointChars: 0,
+        });
+        emit(
+          callbacks,
+          stage,
+          'error',
+          `${stage} : dégénérescence détectée (${degenerationFinding.reason}). Sortie rejetée ; récupération automatique ${recoveryAttempts}/${STEP_DEGENERATION_MAX_RECOVERIES}.`,
+        );
+        if (recoveryAttempts > STEP_DEGENERATION_MAX_RECOVERIES) {
+          recordGenerationHealth(callbacks, {
+            stage,
+            kind: 'analysis',
+            recoveryAttempt: recoveryAttempts - 1,
+            status: 'failed',
+            reasonCode: degenerationFinding.code,
+            reason: `Échec après ${STEP_DEGENERATION_MAX_RECOVERIES} récupérations automatiques : ${degenerationFinding.reason}`,
+            sample: degenerationFinding.sample,
+            generatedChars: lastGuardCheckLength,
+            checkpointChars: 0,
+          });
+          throw new Error(`${stage}: dégénérescence répétée malgré ${STEP_DEGENERATION_MAX_RECOVERIES} récupérations automatiques.`);
+        }
+        messages = withRecoveryInstruction(baseMessages, degenerationFinding.reason, recoveryAttempts, stage);
+        continue;
+      }
+
       const action = consumeStepAction(callbacks, stage);
       if (action === 'restart') {
         emit(callbacks, stage, 'info', `${stage} annulé puis relancé à la demande de l’utilisateur.`);
+        messages = baseMessages;
+        recoveryAttempts = 0;
         continue;
       }
       if (action === 'abandon') {
@@ -549,6 +984,7 @@ async function callJson<T>(
       }
       throw error;
     } finally {
+      detachStepSignal?.();
       finishControlledStep(callbacks, stage);
     }
   }
@@ -565,7 +1001,8 @@ function unwrapFileContent(path: string, raw: string): string {
 }
 
 const FILE_CONTINUATION_TAIL_CHARS = 16_000;
-const FILE_CONTINUATION_MAX_PARTS = 24;
+const FILE_CONTINUATION_MAX_PARTS = 12;
+const FILE_DEGENERATION_MAX_RECOVERIES = 3;
 const FILE_CONTINUATION_MIN_OVERLAP = 24;
 const FILE_CONTINUATION_MAX_OVERLAP = 8_000;
 
@@ -609,6 +1046,8 @@ function continuationMessages(path: string, accumulated: string, part: number, a
     tail,
     '----- FIN DE LA FIN DÉJÀ GÉNÉRÉE -----',
     '',
+    IMPORT_API_USER_RULES,
+    '',
     'Continue immédiatement après ce contenu et retourne uniquement la suite.',
   ].join('\n');
 
@@ -617,6 +1056,32 @@ function continuationMessages(path: string, accumulated: string, part: number, a
     { role: 'user', content: user },
   ];
 }
+
+
+function withRecoveryInstruction(
+  messages: ChatMessage[],
+  reason: string,
+  recoveryAttempt: number,
+  scope = 'cette étape',
+): ChatMessage[] {
+  const strict = recoveryAttempt >= 2;
+  const finalAttempt = recoveryAttempt >= 3;
+  const instruction = [
+    '===== RECOVERY AUTOMATIQUE ANTI-DÉGÉNÉRESCENCE =====',
+    `La tentative précédente a été rejetée car une dégénérescence autoregressive a été détectée (${reason}).`,
+    `Tentative de récupération: ${recoveryAttempt}/${FILE_DEGENERATION_MAX_RECOVERIES}.`,
+    `Périmètre: ${scope}.`,
+    'La sortie rejetée N’EST PAS un contenu valide et ne doit jamais être reproduite, prolongée, résumée ni imitée.',
+    'Repars uniquement du contexte sain présent dans ce prompt et termine dès que le périmètre demandé est complet.',
+    'N’invente aucune série exhaustive non demandée, aucune famille de clés croissante, aucun suffixe répété artificiellement et aucune variante mécanique d’un identifiant.',
+    'Ne génère que les éléments explicitement nécessaires au contrat de cette étape.',
+    strict ? 'MODE STRICT: réduis la réponse au minimum suffisant. Évite toute expansion facultative, exemple supplémentaire, catalogue inventé ou répétition structurelle.' : '',
+    finalAttempt ? 'DERNIÈRE RÉCUPÉRATION: si une information manque, choisis l’implémentation minimale cohérente au lieu d’étendre le périmètre. Arrête la réponse immédiatement après le résultat demandé.' : '',
+    '===== FIN RECOVERY AUTOMATIQUE =====',
+  ].filter(Boolean).join('\n');
+  return [{ role: 'system', content: instruction }, ...messages];
+}
+
 
 async function callFileContent(
   settings: AiSettings,
@@ -639,18 +1104,21 @@ async function callFileContent(
     'Tout diagramme documentaire doit être stocké exclusivement dans un fichier .md et utiliser Mermaid.',
     'Pour tout fichier dont l’extension n’est pas .md, retourne uniquement le format natif du fichier : aucun Markdown, aucune fence ```, aucun diagramme Mermaid et aucune prose décorative.',
     'Le DATA_MODEL fourni est logique et agnostique du moteur. Si plusieurs moteurs sont configurés selon les environnements, implémente dans ce fichier uniquement le moteur/dialecte correspondant à sa cible ; ne mélange jamais plusieurs dialectes dans un même fichier physique.',
+    'N’invente jamais de familles exhaustives artificielles, de suffixes qui croissent indéfiniment ou de séries de clés non demandées.',
     'Si la limite de sortie interrompt ta réponse, arrête-toi naturellement : l’application demandera automatiquement la suite dans un nouvel appel.',
     additionalSystemRules,
     networkContext([...new Set([CORE, ...systemPaths])]),
   ].join('\n');
 
-  let messages: ChatMessage[] = [
+  const initialMessages: ChatMessage[] = [
     { role: 'system', content: system },
     { role: 'user', content: `${userContent}${generationStateMessage(callbacks)}` },
   ];
+  let messages: ChatMessage[] = initialMessages;
 
   let accumulatedFile = '';
   let part = 1;
+  let recoveryAttempts = 0;
   callbacks.onStream?.({ stage, phase: 'start', receivedChars: 0 });
 
   while (part <= FILE_CONTINUATION_MAX_PARTS) {
@@ -662,49 +1130,110 @@ async function callFileContent(
 
     const baseLength = accumulatedFile.length;
     const stepSignal = beginControlledStep(callbacks, stage);
+    const guardController = new AbortController();
+    let detachStepSignal: (() => void) | null = null;
+    if (stepSignal) {
+      const forwardAbort = () => guardController.abort(stepSignal.reason);
+      if (stepSignal.aborted) forwardAbort();
+      else {
+        stepSignal.addEventListener('abort', forwardAbort, { once: true });
+        detachStepSignal = () => stepSignal.removeEventListener('abort', forwardAbort);
+      }
+    }
+
+    let degenerationFinding: ReturnType<typeof detectDegeneration> = null;
+    let lastGuardCheckLength = 0;
     let result: Awaited<ReturnType<typeof chatCompletion>>;
+    const tracePartStage = recoveryAttempts
+      ? `${partStage} · récupération ${recoveryAttempts}/${FILE_DEGENERATION_MAX_RECOVERIES}`
+      : partStage;
     try {
       callbacks.contextLedger ??= new ContextLedgerStore();
-      const fittedMessages = await fitMessagesToContext(settings, messages, partStage, callbacks.contextLedger, {
-        signal: stepSignal,
+      const fittedMessages = await fitMessagesToContext(settings, messages, tracePartStage, callbacks.contextLedger, {
+        signal: guardController.signal,
         onTrace: callbacks.onAiTrace,
         onInfo: (message) => emit(callbacks, stage, 'info', message),
       });
       result = await chatCompletion(settings, fittedMessages, {
-      thinking: false,
-        signal: stepSignal,
-      trace: { stage: partStage, kind: part === 1 ? 'file' : 'file-continuation' },
-      onTrace: callbacks.onAiTrace,
-      onDelta(delta, fragmentAccumulated) {
-        callbacks.onStream?.({
-          stage: partStage,
-          phase: 'delta',
-          delta,
-          receivedChars: baseLength + fragmentAccumulated.length,
+        thinking: false,
+        signal: guardController.signal,
+        trace: { stage: tracePartStage, kind: part === 1 ? 'file' : 'file-continuation' },
+        onTrace: callbacks.onAiTrace,
+        onDelta(delta, fragmentAccumulated) {
+          callbacks.onStream?.({
+            stage: partStage,
+            phase: 'delta',
+            delta,
+            receivedChars: baseLength + fragmentAccumulated.length,
+          });
+          if (!degenerationFinding && fragmentAccumulated.length - lastGuardCheckLength >= 1_200) {
+            lastGuardCheckLength = fragmentAccumulated.length;
+            const finding = detectDegeneration(fragmentAccumulated);
+            if (finding) {
+              degenerationFinding = finding;
+              guardController.abort('DEGENERATION_DETECTED');
+            }
+          }
+        },
+        onReasoningDelta(delta, accumulated) {
+          callbacks.onStream?.({
+            stage: partStage,
+            phase: 'reasoning',
+            reasoningDelta: delta,
+            receivedChars: baseLength,
+            receivedReasoningChars: accumulated.length,
+          });
+        },
+        onRetry(info) {
+          const diagnostic = info.hadReasoning
+            ? `${info.reasoningChars.toLocaleString('fr-FR')} caractères de reasoning sans content`
+            : 'réponse vide sans content';
+          emit(
+            callbacks,
+            stage,
+            'info',
+            `${path} (fragment ${part}) : ${diagnostic}. Nouvelle tentative ${info.attempt}/${info.maxAttempts}.`,
+          );
+        },
+      });
+    } catch (error) {
+      if ((degenerationFinding as {code: any, reason: any, sample: any} | null)) {
+        recoveryAttempts += 1;
+        recordGenerationHealth(callbacks, {
+          stage,
+          kind: 'file',
+          target: path,
+          fragment: part,
+          recoveryAttempt: recoveryAttempts,
+          status: 'detected',
+          reasonCode: degenerationFinding.code,
+          reason: degenerationFinding.reason,
+          sample: degenerationFinding.sample,
+          generatedChars: lastGuardCheckLength,
+          checkpointChars: accumulatedFile.length,
         });
-      },
-      onReasoningDelta(delta, accumulated) {
-        callbacks.onStream?.({
-          stage: partStage,
-          phase: 'reasoning',
-          reasoningDelta: delta,
-          receivedChars: baseLength,
-          receivedReasoningChars: accumulated.length,
-        });
-      },
-      onRetry(info) {
-        const diagnostic = info.hadReasoning
-          ? `${info.reasoningChars.toLocaleString('fr-FR')} caractères de reasoning sans content`
-          : 'réponse vide sans content';
         emit(
           callbacks,
           stage,
-          'info',
-          `${path} (fragment ${part}) : ${diagnostic}. Nouvelle tentative ${info.attempt}/${info.maxAttempts}.`,
+          'error',
+          `${path} (fragment ${part}) : boucle/dégénérescence détectée (${degenerationFinding.reason}). ` +
+          `Le fragment corrompu est rejeté et la reprise repart du dernier checkpoint sain (${recoveryAttempts}/${FILE_DEGENERATION_MAX_RECOVERIES}).`,
         );
-      },
-      });
-    } catch (error) {
+        if (recoveryAttempts > FILE_DEGENERATION_MAX_RECOVERIES) {
+          recordGenerationHealth(callbacks, {
+            stage, kind: 'file', target: path, fragment: part, recoveryAttempt: FILE_DEGENERATION_MAX_RECOVERIES, status: 'failed',
+            reasonCode: degenerationFinding.code, reason: degenerationFinding.reason, sample: degenerationFinding.sample,
+            generatedChars: lastGuardCheckLength, checkpointChars: accumulatedFile.length,
+          });
+          throw new Error(`${path}: dégénérescence répétée malgré ${FILE_DEGENERATION_MAX_RECOVERIES} récupérations automatiques sur le fragment ${part}. Génération arrêtée avant contamination des fragments suivants.`);
+        }
+        const safeMessages = part === 1
+          ? initialMessages
+          : continuationMessages(path, accumulatedFile, part, additionalSystemRules);
+        messages = withRecoveryInstruction(safeMessages, degenerationFinding.reason, recoveryAttempts, `${path} · fragment ${part}`);
+        continue;
+      }
+
       const action = consumeStepAction(callbacks, stage);
       if (action === 'restart') {
         emit(callbacks, stage, 'info', `${path}: requête annulée puis relancée à la demande de l’utilisateur.`);
@@ -718,6 +1247,7 @@ async function callFileContent(
       }
       throw error;
     } finally {
+      detachStepSignal?.();
       finishControlledStep(callbacks, stage);
     }
 
@@ -725,6 +1255,46 @@ async function callFileContent(
       throw new Error(`Le modèle a renvoyé un fragment vide pour ${path} (fragment ${part}).`);
     }
 
+    const completedFinding = detectDegeneration(result.content);
+    if (completedFinding) {
+      recoveryAttempts += 1;
+      recordGenerationHealth(callbacks, {
+        stage, kind: 'file', target: path, fragment: part, recoveryAttempt: recoveryAttempts, status: 'detected',
+        reasonCode: completedFinding.code, reason: completedFinding.reason, sample: completedFinding.sample,
+        generatedChars: result.content.length, checkpointChars: accumulatedFile.length,
+      });
+      emit(
+        callbacks,
+        stage,
+        'error',
+        `${path} (fragment ${part}) rejeté avant checkpoint (${completedFinding.reason}). ` +
+        `Reprise depuis le dernier contenu sain (${recoveryAttempts}/${FILE_DEGENERATION_MAX_RECOVERIES}).`,
+      );
+      if (recoveryAttempts > FILE_DEGENERATION_MAX_RECOVERIES) {
+        recordGenerationHealth(callbacks, {
+          stage, kind: 'file', target: path, fragment: part, recoveryAttempt: FILE_DEGENERATION_MAX_RECOVERIES, status: 'failed',
+          reasonCode: completedFinding.code, reason: completedFinding.reason, sample: completedFinding.sample,
+          generatedChars: result.content.length, checkpointChars: accumulatedFile.length,
+        });
+        throw new Error(`${path}: dégénérescence répétée malgré ${FILE_DEGENERATION_MAX_RECOVERIES} récupérations automatiques sur le fragment ${part}.`);
+      }
+      const safeMessages = part === 1
+        ? initialMessages
+        : continuationMessages(path, accumulatedFile, part, additionalSystemRules);
+      messages = withRecoveryInstruction(safeMessages, completedFinding.reason, recoveryAttempts, `${path} · fragment ${part}`);
+      continue;
+    }
+
+    // Le fragment est sain : il peut devenir le nouveau checkpoint.
+    if (recoveryAttempts > 0) {
+      recordGenerationHealth(callbacks, {
+        stage, kind: 'file', target: path, fragment: part, recoveryAttempt: recoveryAttempts, status: 'recovered',
+        reasonCode: 'automatic-recovery', reason: 'Le fragment régénéré est sain et devient le nouveau checkpoint.',
+        generatedChars: result.content.length, checkpointChars: accumulatedFile.length + result.content.length,
+      });
+      emit(callbacks, stage, 'info', `${path} (fragment ${part}) : récupération automatique réussie.`);
+    }
+    recoveryAttempts = 0;
     const merged = appendContinuation(accumulatedFile, result.content);
     accumulatedFile = merged.content;
     if (merged.overlap > 0) {
@@ -752,7 +1322,7 @@ async function callFileContent(
       callbacks,
       stage,
       'info',
-      `${path}: fragment ${part} interrompu par la limite de sortie (${result.content.length.toLocaleString('fr-FR')} caractères reçus). Continuation automatique.`,
+      `${path}: fragment ${part} validé puis interrompu par la limite de sortie (${result.content.length.toLocaleString('fr-FR')} caractères). Continuation depuis le checkpoint sain.`,
     );
 
     part += 1;
@@ -761,7 +1331,7 @@ async function callFileContent(
 
   throw new Error(
     `Le fichier ${path} dépasse ${FILE_CONTINUATION_MAX_PARTS} fragments IA successifs. ` +
-    `La génération a déjà produit ${accumulatedFile.length.toLocaleString('fr-FR')} caractères ; ` +
+    `La génération a déjà produit ${accumulatedFile.length.toLocaleString('fr-FR')} caractères sains ; ` +
     'il est préférable de découper ce fichier en modules plus petits.',
   );
 }
@@ -881,6 +1451,7 @@ export async function generateShop(
     ? ['DÉPÔT EXISTANT: préserver la base importée.', ...repositoryContext.rules].map((rule) => `- ${rule}`).join('\n')
     : '';
   callbacks.generationState = { abandonedSteps: [] };
+  callbacks.generationHealth = { version: 1, automaticRecoveries: 0, detections: 0, failures: 0, events: [] };
   callbacks.contextLedger = new ContextLedgerStore();
   const artifacts: Record<string, unknown> = { I18N_SPEC: i18nContext, EXISTING_REPOSITORY: repositoryContext.enabled ? {
     archiveName: repositoryContext.archiveName,
@@ -925,7 +1496,7 @@ export async function generateShop(
   const implementationPlan = await callJson<unknown>(
     settings,
     ['agents/03-micro-shop-project-planner.agent.md', 'contracts/testing-contract.md', 'contracts/artifact-layout.md'],
-    `Produis IMPLEMENTATION_PLAN. Il doit inclure conception, tests avant lots, SEO si activé, agentification, implémentation, validation et boucle de correction. Si l’i18n est activée, planifie explicitement la configuration, les catalogues de toutes les langues sélectionnées, l’utilisation systématique des clés dans le code et les tests de parité des clés.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}`,
+    `Produis IMPLEMENTATION_PLAN. Il doit inclure conception, tests avant lots, SEO si activé, agentification, implémentation, validation et boucle de correction. Si l’i18n est activée, planifie explicitement la configuration, l’utilisation systématique des clés dans le code, puis une PHASE I18N FINALE après toute l’implémentation applicative pour produire les catalogues de toutes les langues sélectionnées à partir des clés réellement utilisées, avec tests de parité.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}`,
     callbacks,
     'planification',
   );
@@ -1043,7 +1614,7 @@ export async function generateShop(
   artifacts.TEST_PLAN = await callJson<unknown>(
     settings,
     ['agents/13b-micro-shop-testing-engineer.agent.md', 'skills/testing-engineer/SKILL.md', 'contracts/testing-contract.md'],
-    `Produis TEST_PLAN avant implémentation. Tu ne peux pas exécuter les futurs tests dans ce navigateur : planifie les tests exécutables et marque toute preuve d'exécution comme pending. Si l’i18n est activée, ajoute obligatoirement des tests garantissant que chaque langue sélectionnée possède exactement le même ensemble de clés et que les principaux écrans n’embarquent pas de wording statique à la place de clés i18n.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
+    `Produis TEST_PLAN avant implémentation. Tu ne peux pas exécuter les futurs tests dans ce navigateur : planifie les tests exécutables et marque toute preuve d'exécution comme pending. Si l’i18n est activée, ajoute obligatoirement des tests garantissant que chaque fichier de traduction de chaque langue sélectionnée possède exactement le même ensemble de clés que les clés réellement utilisées dans les fichiers source de l’application et que les principaux écrans n’embarquent pas de wording statique à la place de clés i18n.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
     callbacks,
     'plan de tests',
   );
@@ -1051,7 +1622,7 @@ export async function generateShop(
   const buildPlan = await callJson<BuildPlan>(
     settings,
     ['agents/09-micro-shop-implementation-orchestrator.agent.md', 'contracts/artifact-layout.md'],
-    `Prépare un plan de génération de fichiers concret, borné et ordonné. Réponds {"batches":[{"id":"B1","objective":"...","owner":"frontoffice-builder|backoffice-builder|backend-builder|implementation-orchestrator","files":["path"],"contextPaths":["path déjà généré utile"]}],"i18n":{"enabled":true,"defaultLocale":"fr","locales":[{"code":"fr","resourceFiles":["path"]}],"configFiles":["path"],"verificationFiles":["path"]},"notes":[]}. Si l’i18n est désactivée, utilise {"enabled":false,"locales":[]}. Si elle est activée, i18n.defaultLocale doit être EXACTEMENT la langue par défaut de I18N_SPEC et doit appartenir à i18n.locales ; i18n.locales doit contenir EXACTEMENT toutes les langues de I18N_SPEC, chacune avec au moins un resourceFiles réellement prévu dans batches ; un même fichier peut être partagé par plusieurs locales si le framework stocke plusieurs catalogues dans un module unique. Prévois également la configuration i18n et au moins un test de parité/complétude des clés. Maximum ${form.output.maxBatches} lots, maximum 14 fichiers par lot. Chaque fichier de code, config, documentation et test nécessaire doit apparaître exactement une fois dans files, sauf modification ultérieure explicitement nécessaire. DATA_MODEL est un modèle logique unique et agnostique du moteur : ne crée jamais un data-model différent par environnement. Si TECH_STACK utilise plusieurs moteurs selon les environnements, prévois seulement les fichiers physiques nécessaires (configuration, adaptateurs, migrations) séparément par moteur/environnement, tous conformes au même DATA_MODEL, sans mélanger plusieurs dialectes SQL dans un même fichier. Tout diagramme documentaire doit être un fichier .md contenant un bloc Mermaid ; n'inclus jamais de .puml, .plantuml, .dot, .gv, .mmd ni d'image de diagramme. Aucun Markdown ne doit apparaître dans un fichier non-.md. Les diagrammes canoniques déjà produits dans .ai/diagrams/ ne doivent pas être recréés.\n${repositoryRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DESIGN', artifacts.DESIGN)}${artifactMessage('DATA_MODEL', artifacts.DATA_MODEL)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('SEO', artifacts.SEO ?? null)}${artifactMessage('TEST_PLAN', artifacts.TEST_PLAN)}${artifactMessage('DIAGRAMS', artifacts.DIAGRAMS)}\nINSTRUCTIONS SUPPLÉMENTAIRES UTILISATEUR:\n${form.output.extraInstructions || '(aucune)'}`,
+    `Prépare un plan de génération de fichiers concret, borné et ordonné. Réponds {"batches":[{"id":"B1","objective":"...","owner":"frontoffice-builder|backoffice-builder|backend-builder|implementation-orchestrator","files":["path"],"contextPaths":["path déjà généré utile"]}],"i18n":{"enabled":true,"defaultLocale":"fr","locales":[{"code":"fr","resourceFiles":["path"]}],"configFiles":["path"],"verificationFiles":["path"]},"notes":[]}. Si l’i18n est désactivée, utilise {"enabled":false,"locales":[]}. Si elle est activée, i18n.defaultLocale doit être EXACTEMENT la langue par défaut de I18N_SPEC et doit appartenir à i18n.locales ; i18n.locales doit contenir EXACTEMENT toutes les langues de I18N_SPEC, chacune avec EXACTEMENT UN chemin dans resourceFiles. Ce fichier de traduction par locale devra contenir le jeu COMPLET des clés réellement utilisées dans les fichiers source de l’application, et toutes les locales devront avoir STRICTEMENT le même ensemble de clés. IMPORTANT: les fichiers de traduction déclarés dans resourceFiles sont générés par l'application hôte dans une PHASE I18N FINALE, après toutes les pages, composants, layouts, services et routes API : NE LES INCLUS PAS dans batches. Utilise obligatoirement un fichier de catalogue dédié, unique et distinct par locale, de préférence JSON ; si tu choisis TS/JS, la configuration doit consommer un export default. N’utilise jamais un même fichier de traduction pour plusieurs locales. Les fichiers de configuration i18n et les tests de parité/complétude, eux, doivent être prévus dans batches. Maximum ${form.output.maxBatches} lots, maximum 14 fichiers par lot. Chaque fichier de code, config, documentation et test nécessaire doit apparaître exactement une fois dans files, sauf modification ultérieure explicitement nécessaire. DATA_MODEL est un modèle logique unique et agnostique du moteur : ne crée jamais un data-model différent par environnement. Si TECH_STACK utilise plusieurs moteurs selon les environnements, prévois seulement les fichiers physiques nécessaires (configuration, adaptateurs, migrations) séparément par moteur/environnement, tous conformes au même DATA_MODEL, sans mélanger plusieurs dialectes SQL dans un même fichier. Tout diagramme documentaire doit être un fichier .md contenant un bloc Mermaid ; n'inclus jamais de .puml, .plantuml, .dot, .gv, .mmd ni d'image de diagramme. Aucun Markdown ne doit apparaître dans un fichier non-.md. Les diagrammes canoniques déjà produits dans .ai/diagrams/ ne doivent pas être recréés.\n${repositoryRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DESIGN', artifacts.DESIGN)}${artifactMessage('DATA_MODEL', artifacts.DATA_MODEL)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('SEO', artifacts.SEO ?? null)}${artifactMessage('TEST_PLAN', artifacts.TEST_PLAN)}${artifactMessage('DIAGRAMS', artifacts.DIAGRAMS)}\nINSTRUCTIONS SUPPLÉMENTAIRES UTILISATEUR:\n${form.output.extraInstructions || '(aucune)'}`,
     callbacks,
     'plan de génération',
   );
@@ -1061,7 +1632,7 @@ export async function generateShop(
 
   const batches = buildPlanAbandoned ? [] : safeBatches(buildPlan, form.output.maxBatches);
   if (!buildPlanAbandoned && !batches.length) throw new Error("Le modèle n'a produit aucun lot de génération exploitable.");
-  if (!buildPlanAbandoned) assertI18nResourcesScheduled(buildPlan, i18nContext, batches);
+  const deferredI18nResourcePaths = buildPlanAbandoned ? new Set<string>() : declaredI18nResourcePaths(buildPlan, i18nContext);
 
   for (const [batchIndex, batch] of batches.entries()) {
     assertNotAborted(callbacks.signal);
@@ -1084,6 +1655,10 @@ export async function generateShop(
       const safePath = sanitizeGeneratedPath(requestedPath);
       if (!safePath) {
         emit(callbacks, `lot ${batch.id}`, 'info', `Fichier ignoré car chemin non autorisé: ${requestedPath}`);
+        continue;
+      }
+      if (deferredI18nResourcePaths.has(safePath)) {
+        emit(callbacks, `lot ${batch.id}`, 'info', `${safePath} différé : les catalogues i18n sont générés uniquement après tout le code applicatif.`);
         continue;
       }
 
@@ -1122,8 +1697,10 @@ export async function generateShop(
         `- ne prétends pas avoir exécuté les tests;\n` +
         `- si ce fichier est un .md et contient un diagramme documentaire, utilise Markdown + Mermaid uniquement;\n` +
         `- si ce fichier n'est PAS un .md, son contenu doit être exclusivement dans son format natif : aucun Markdown, aucune fence Markdown, aucune source Mermaid;\n` +
-        `- DATA_MODEL est commun à tous les environnements. Si ce fichier est spécifique à une base de données, n'utilise que le dialecte du moteur ciblé par cet environnement et ne mélange jamais plusieurs moteurs dans le même fichier.\n` +        (i18nContext.enabled
-          ? `- INTERNATIONALISATION OBLIGATOIRE: tous les wordings statiques visibles par l’utilisateur doivent utiliser des clés i18n dans le code ; aucune chaîne UI brute. Chaque clé doit être traduite dans toutes les langues sélectionnées: ${i18nContext.locales.join(', ')}. Les catalogues doivent partager exactement les mêmes clés.\n`
+        `- DATA_MODEL est commun à tous les environnements. Si ce fichier est spécifique à une base de données, n'utilise que le dialecte du moteur ciblé par cet environnement et ne mélange jamais plusieurs moteurs dans le même fichier.\n` +
+        `${buildStackImportContract(techStack, safePath)}` +
+        (i18nContext.enabled
+          ? `- INTERNATIONALISATION OBLIGATOIRE: tous les wordings statiques visibles par l’utilisateur doivent utiliser des clés i18n stables et hiérarchiques dans le code ; aucune chaîne UI brute. NE GÉNÈRE PAS de catalogue de traduction dans ce fichier sauf si ${safePath} est explicitement un resourceFiles du BUILD_PLAN : les catalogues sont différés jusqu'à la phase i18n finale, après toutes les pages, composants et routes API.\n`
           : '') +
         `${repositoryImplementationRules}\n` +
         `${artifactMessage('I18N_SPEC', i18nContext)}` +
@@ -1153,10 +1730,15 @@ export async function generateShop(
     }
   }
 
+  if (!buildPlanAbandoned && i18nContext.enabled) {
+    await generateFinalI18nResources(settings, buildPlan, i18nContext, files, binaryFiles, callbacks);
+  }
   if (!buildPlanAbandoned) assertGeneratedI18nResources(buildPlan, i18nContext, files);
 
   artifacts.GENERATION_STATE = callbacks.generationState;
+  artifacts.GENERATION_HEALTH = callbacks.generationHealth;
   files.set('.ai/generation-state.json', stableJson(callbacks.generationState));
+  files.set('.ai/generation-health.json', stableJson(callbacks.generationHealth));
 
   // JSON est valide en YAML 1.2 : on conserve ainsi des artefacts structurés
   // déterministes tout en respectant les chemins canoniques du réseau.

@@ -24,7 +24,10 @@
     "@webcontainer/api": "1.6.4",
     "@php-wasm/web-8-4": "3.1.56",
     "@php-wasm/universal": "3.1.56",
-    "@wasmer/sdk": "0.19.0"
+    "@wasmer/sdk": "0.19.0",
+    "dompurify": "3.4.16",
+    "marked": "16.4.2",
+    "shiki": "4.4.3"
   },
   "allowScripts": {
     "esbuild": true

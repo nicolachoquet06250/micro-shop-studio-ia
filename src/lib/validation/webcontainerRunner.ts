@@ -67,7 +67,23 @@ function detectPackageManager(result: GenerationResult, pkg: PackageJson | null)
 function installArgs(manager: 'npm' | 'pnpm' | 'yarn'): [string, string[]] {
   if (manager === 'pnpm') return ['npx', ['--yes', 'pnpm', 'install', '--frozen-lockfile=false']];
   if (manager === 'yarn') return ['npx', ['--yes', 'yarn', 'install']];
-  return ['npm', ['install', '--no-audit', '--no-fund']];
+  // Les validations exécutent les tests et démarrent le serveur de développement : les devDependencies sont indispensables.
+  // --include=dev neutralise explicitement un éventuel NODE_ENV=production hérité du WebContainer.
+  return ['npm', ['install', '--include=dev', '--no-audit', '--no-fund']];
+}
+
+const VALIDATION_INSTALL_ENV: Record<string, string> = {
+  CI: 'true',
+  FORCE_COLOR: '0',
+  NODE_ENV: 'development',
+  NPM_CONFIG_PRODUCTION: 'false',
+  NPM_CONFIG_INCLUDE: 'dev',
+};
+
+function devDependenciesWereOmitted(output: string): boolean {
+  const normalized = output.toLowerCase();
+  return normalized.includes('devdependencies: skipped because node_env is set to production')
+    || normalized.includes('npm_config_production') && normalized.includes('devdependenc');
 }
 
 function scriptArgs(manager: 'npm' | 'pnpm' | 'yarn', script: string): [string, string[]] {
@@ -117,6 +133,8 @@ export class WebContainerRunner implements RuntimeRunner {
     if (!this.instance) return this.prepare(result, callbacks);
     this.result = result;
     await this.instance.mount(createTree(result));
+    const pkg = parsePackageJson(result);
+    this.packageManager = detectPackageManager(result, pkg);
   }
 
   private async runProcess(
@@ -125,6 +143,7 @@ export class WebContainerRunner implements RuntimeRunner {
     args: string[],
     callbacks: ValidationCallbacks,
     timeoutMs = COMMAND_TIMEOUT_MS,
+    env: Record<string, string> = {},
   ): Promise<ValidationCommandResult> {
     if (!this.instance) throw new Error('WebContainer non initialisé.');
     assertValidationNotAborted(callbacks.signal);
@@ -134,7 +153,9 @@ export class WebContainerRunner implements RuntimeRunner {
     let output = '';
     let process: WebContainerProcess | null = null;
     try {
-      process = await this.instance.spawn(command, args, { env: { CI: 'true', FORCE_COLOR: '0' } });
+      process = await this.instance.spawn(command, args, {
+        env: { CI: 'true', FORCE_COLOR: '0', ...env },
+      });
       const readOutput = process.output.pipeTo(new WritableStream<string>({
         write: (chunk) => {
           const clean = removeAnsi(chunk);
@@ -200,9 +221,127 @@ export class WebContainerRunner implements RuntimeRunner {
     }
 
     const [command, args] = installArgs(this.packageManager);
-    const result = await this.runProcess('Installation des dépendances', command, args, callbacks);
+    let result = await this.runProcess(
+      'Installation des dépendances',
+      command,
+      args,
+      callbacks,
+      COMMAND_TIMEOUT_MS,
+      VALIDATION_INSTALL_ENV,
+    );
+
+    // Filet de sécurité : un environnement hôte ne doit jamais faire consommer une boucle IA
+    // simplement parce qu'il a réimposé NODE_ENV=production et supprimé les devDependencies.
+    if (result.status === 'failed' && devDependenciesWereOmitted(result.output)) {
+      emitValidation(
+        callbacks,
+        'info',
+        'Le runtime a omis les devDependencies à cause de NODE_ENV=production ; nouvelle installation locale sans consommer de correction IA…',
+        this.runtime,
+      );
+      const retryArgs = this.packageManager === 'npm'
+        ? ['install', '--include=dev', '--production=false', '--no-audit', '--no-fund']
+        : args;
+      const retry = await this.runProcess(
+        'Installation des dépendances · reprise environnement',
+        command,
+        retryArgs,
+        callbacks,
+        COMMAND_TIMEOUT_MS,
+        VALIDATION_INSTALL_ENV,
+      );
+      result = {
+        ...retry,
+        output: `${result.output}\n\n[reprise environnement]\n${retry.output}`,
+      };
+    }
+
     if (result.status === 'passed') this.installFingerprint = fingerprint;
     return result;
+  }
+
+  private async runDevSmokeCheck(callbacks: ValidationCallbacks): Promise<ValidationCommandResult> {
+    if (!this.instance) throw new Error('WebContainer non initialisé.');
+    assertValidationNotAborted(callbacks.signal);
+    const started = performance.now();
+    const [command, args] = scriptArgs(this.packageManager, 'dev');
+    const printable = `${command} ${args.join(' ')}`.trim();
+    emitValidation(callbacks, 'command', `$ ${printable}`, this.runtime);
+
+    let output = '';
+    let process: WebContainerProcess | null = null;
+    let unsubscribe: (() => void) | null = null;
+    let timeoutId: number | null = null;
+
+    try {
+      const ready = new Promise<{ port: number; url: string }>((resolve) => {
+        unsubscribe = this.instance!.on('server-ready', (port: number, url: string) => resolve({ port, url }));
+      });
+      const timeout = new Promise<{ timeout: true }>((resolve) => {
+        timeoutId = window.setTimeout(() => resolve({ timeout: true }), 90_000);
+      });
+
+      process = await this.instance.spawn(command, args, {
+        env: { FORCE_COLOR: '0', NODE_ENV: 'development' },
+      });
+      void process.output.pipeTo(new WritableStream<string>({
+        write: (chunk) => {
+          const clean = removeAnsi(chunk);
+          output += clean;
+          emitValidation(callbacks, 'output', clean, this.runtime);
+        },
+      })).catch(() => undefined);
+
+      const outcome = await Promise.race([
+        ready.then((value) => ({ kind: 'ready' as const, ...value })),
+        process.exit.then((code: number) => ({ kind: 'exit' as const, code })),
+        timeout.then(() => ({ kind: 'timeout' as const })),
+      ]);
+
+      if (outcome.kind === 'ready') {
+        output += `\n[server-ready] ${outcome.url} (port ${outcome.port})`;
+        return {
+          runtime: this.runtime,
+          label: 'npm script · dev',
+          command: printable,
+          status: 'passed',
+          exitCode: 0,
+          output,
+          durationMs: Math.round(performance.now() - started),
+        };
+      }
+
+      if (outcome.kind === 'exit') {
+        output += `\nLe serveur de développement s'est arrêté avant d'exposer un port (code ${outcome.code}).`;
+      } else {
+        output += '\nTimeout : le serveur de développement n’a exposé aucun port après 90 secondes.';
+      }
+      return {
+        runtime: this.runtime,
+        label: 'npm script · dev',
+        command: printable,
+        status: 'failed',
+        exitCode: outcome.kind === 'exit' ? outcome.code : null,
+        output,
+        durationMs: Math.round(performance.now() - started),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      output += `\n${message}`;
+      return {
+        runtime: this.runtime,
+        label: 'npm script · dev',
+        command: printable,
+        status: 'failed',
+        exitCode: null,
+        output,
+        durationMs: Math.round(performance.now() - started),
+      };
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      unsubscribe?.();
+      process?.kill();
+    }
   }
 
   async validate(callbacks: ValidationCallbacks): Promise<RuntimeValidationResult> {
@@ -216,38 +355,37 @@ export class WebContainerRunner implements RuntimeRunner {
       return { runtime: this.runtime, label: this.label, supported: true, passed: false, partial: false, commands, notes: ['Les dépendances n’ont pas pu être installées.'] };
     }
 
-    const orderedScripts = [
-      'test', 'test:unit', 'test:integration',
-      'lint',
-      'typecheck', 'type-check', 'check',
-      'build',
-    ];
-    const selected: string[] = [];
-    for (const script of orderedScripts) {
-      if (!scripts[script]) continue;
-      if (script === 'check' && (scripts.typecheck || scripts['type-check'])) continue;
-      if (script.startsWith('test:') && scripts.test) continue;
-      if (!selected.includes(script)) selected.push(script);
+    const selectedTests: string[] = [];
+    if (scripts.test) {
+      selectedTests.push('test');
+    } else {
+      for (const script of ['test:unit', 'test:integration', 'test:e2e']) {
+        if (scripts[script]) selectedTests.push(script);
+      }
     }
 
-    for (const script of selected) {
+    for (const script of selectedTests) {
       assertValidationNotAborted(callbacks.signal);
       const [command, args] = scriptArgs(this.packageManager, script);
       commands.push(await this.runProcess(`npm script · ${script}`, command, args, callbacks));
     }
 
+    if (scripts.dev) {
+      assertValidationNotAborted(callbacks.signal);
+      commands.push(await this.runDevSmokeCheck(callbacks));
+    }
+
     const executed = commands.filter((command) => command.status !== 'skipped');
     const failed = executed.some((command) => command.status === 'failed');
-    const hasQualityCommand = selected.length > 0;
-    const notes = hasQualityCommand
-      ? []
-      : ['Aucun script test/lint/typecheck/build n’est déclaré dans package.json.'];
+    const notes: string[] = [];
+    if (!selectedTests.length) notes.push('Aucun script de test exécutable n’est déclaré dans package.json.');
+    if (!scripts.dev) notes.push('Aucun script dev n’est déclaré dans package.json ; le démarrage du serveur de développement n’a pas pu être vérifié.');
     return {
       runtime: this.runtime,
       label: this.label,
       supported: true,
       passed: !failed,
-      partial: !hasQualityCommand,
+      partial: notes.length > 0,
       commands,
       notes,
     };

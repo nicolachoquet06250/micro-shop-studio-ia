@@ -14,6 +14,20 @@ interface FixPlan {
   }>;
 }
 
+const IMPORT_API_USER_RULES = [
+  'RÈGLES IMPÉRATIVES D’IMPORTS ET D’API:',
+  'Avant tout import, renseigne-toi sur le package exact, son sous-package, son dialecte et sa version lorsque ces informations sont disponibles.',
+  'Importe uniquement des symboles réellement exportés par le module exact ciblé.',
+  'Vérifie chaque symbole à partir des dépendances, fichiers existants, types/signatures, logs, contexte technique ou documentation disponible.',
+  'N’invente aucun export et ne transpose jamais un symbole provenant d’un autre dialecte, adapter, runtime, framework ou sous-package.',
+  'En cas de doute, aucun import spéculatif : conserve ou utilise uniquement une API dont la présence est établie.',
+  'Avant de rendre le fichier corrigé, contrôle chaque import : package ↔ symbole ↔ dialecte ↔ version ↔ usage.',
+  'Exemple interdit : `pgTable` depuis `drizzle-orm/mysql-core`.',
+  'Pour Nuxt/Nitro, ne suppose jamais qu’un symbole est disponible via `#imports`, `#app`, `nuxt/app`, `h3` ou un alias virtuel : vérifie l’export/auto-import exact pour la version réellement installée.',
+  'Interdit notamment : utiliser `getRoutePath` depuis `#imports` sans preuve que la version Nuxt/Nitro du projet l’expose.',
+  'Si le log signale un MISSING_EXPORT, UNLOADABLE_DEPENDENCY ou un auto-import introuvable, corrige la source de manière cohérente avec les exports réellement présents au lieu d’inventer un autre symbole proche.',
+].join('\n');
+
 const FIX_NETWORK = [
   'agents/15-micro-shop-fix-coordinator.agent.md',
   'agents/13b-micro-shop-testing-engineer.agent.md',
@@ -72,7 +86,7 @@ async function generateFixedFile(
   const system = [
     'Tu appliques une correction ciblée après exécution réelle des validations du projet.',
     `Tu dois produire exactement un fichier complet : ${path}.`,
-    'Les logs de test/build fournis sont des preuves réelles : corrige leur cause sans inventer de succès.',
+    'Les logs de tests et de démarrage `npm run dev` fournis sont des preuves réelles : corrige leur cause sans inventer de succès.',
     'Retourne uniquement le contenu du fichier, sans JSON, sans explication et sans fence artificielle.',
     path.endsWith('.md')
       ? 'Markdown est autorisé dans ce fichier .md.'
@@ -90,6 +104,8 @@ async function generateFixedFile(
     '',
     'FICHIERS DE CONTEXTE:',
     contexts || '(aucun)',
+    '',
+    IMPORT_API_USER_RULES,
   ].join('\n');
 
   let accumulated = '';
@@ -132,7 +148,7 @@ async function generateFixedFile(
       },
       {
         role: 'user',
-        content: `FIN DÉJÀ GÉNÉRÉE (ne pas répéter):\n${end}\n\nContinue immédiatement.`,
+        content: `FIN DÉJÀ GÉNÉRÉE (ne pas répéter):\n${end}\n\n${IMPORT_API_USER_RULES}\n\nContinue immédiatement.`,
       },
     ];
   }
@@ -148,7 +164,7 @@ export async function repairFromValidation(
   const evidence = validationEvidence(runtimes);
   if (!evidence.trim()) return { result, changedFiles: [], summary: 'Aucune erreur exécutable à corriger.' };
 
-  emitValidation(callbacks, 'repair', 'Le fix-coordinator analyse les résultats réels des tests/builds…');
+  emitValidation(callbacks, 'repair', 'Le fix-coordinator analyse les résultats réels des tests et du démarrage `npm run dev`…');
   const planningMessages: ChatMessage[] = [
     {
       role: 'system',
@@ -157,6 +173,7 @@ export async function repairFromValidation(
         'Analyse uniquement les erreurs réellement observées et retourne un plan JSON minimal.',
         'Schéma attendu: {"summary":"...","files":[{"path":"...","reason":"...","contextPaths":["..."]}]}',
         'Maximum 6 fichiers. Ne planifie que des fichiers nécessaires à la correction.',
+        'Pour les erreurs Nuxt/Nitro `#imports`/auto-imports/MISSING_EXPORT, cible d’abord le fichier qui utilise réellement le symbole invalide et n’invente jamais un autre auto-import sans preuve.',
         networkContext(FIX_NETWORK),
       ].join('\n'),
     },
@@ -200,7 +217,17 @@ export async function repairFromValidation(
   const changedFiles: string[] = [];
   for (const target of targets) {
     const current = getTextFile(updated, target.path);
-    const contexts = target.contextPaths
+    const groundedContextPaths = [...new Set([
+      ...target.contextPaths,
+      'package.json',
+      'package-lock.json',
+      'pnpm-lock.yaml',
+      'yarn.lock',
+      'nuxt.config.ts',
+      'nuxt.config.js',
+      'nuxt.config.mjs',
+    ])];
+    const contexts = groundedContextPaths
       .filter((path) => path !== target.path)
       .map((path) => {
         const content = getTextFile(updated, path);

@@ -18,11 +18,13 @@ import '../styles/global.css';
         document.documentElement.style.colorScheme = resolved;
       })();
     </script>
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="viewport" content="width=device-width" />
     <meta name="generator" content={Astro.generator} />
     <meta name="description" content="Configuration de l’endpoint IA OpenAI-compatible." />
     <title>Paramètres IA · Micro Shop Studio</title>
   </head>
-  <body><SettingsApp client:load /></body>
+  <body><SettingsApp client:only="vue" /></body>
 </html>

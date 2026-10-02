@@ -171,3 +171,11 @@ Si le prompt dépasse le budget d'entrée, l'application ne supprime pas silenci
 ## Vite 8 / PHP.wasm
 
 Le build intercepte l’import binaire de `@php-wasm/web-8-4` via un plugin Vite local. Le module Emscripten attend une URL d’asset en export par défaut, alors que Vite 8/Rolldown interprète sinon le `.wasm` comme un module WebAssembly et échoue avec `MISSING_EXPORT`. Le plugin `micro-shop:php-wasm-asset-url` remplace uniquement cet import par un module virtuel qui émet le binaire comme asset et exporte son URL finale.
+
+## Phase i18n finale déterministe et garde anti-boucle
+
+Lorsque l’internationalisation est activée, les fichiers de catalogues déclarés dans `BUILD_PLAN.i18n.locales[].resourceFiles` ne sont plus générés pendant les lots d’implémentation. Les pages, composants, layouts, services et routes API sont d’abord produits avec des clés i18n stables. Une phase finale extrait ensuite de façon déterministe les clés réellement référencées par le code, conserve leur contexte d’usage dans `.ai/i18n/usages.json`, puis génère les traductions par lots bornés de clés.
+
+Chaque lot de traduction doit retourner exactement l’ensemble de clés demandé. Les clés manquantes, supplémentaires, renommées ou les sorties présentant une dégénérescence sont rejetées puis retentées. Les catalogues finaux sont rendus par l’application elle-même (JSON/TS/JS/YAML/properties selon le chemin déclaré), ce qui évite les longues continuations IA pour les fichiers de traduction. Le registre canonique est écrit dans `.ai/i18n/keys.json` et la parité finale dans `.ai/i18n/report.json`.
+
+La génération générale des fichiers utilise également des checkpoints : un fragment n’est ajouté au fichier courant qu’après passage du garde anti-dégénérescence. Les motifs de suffixes répétés/croissants de type `ValueValueValue` ou `...thianthianthian...` provoquent l’annulation du fragment, son rejet complet et une reprise depuis le dernier checkpoint sain. Après trois rechutes sur le même fragment, le fichier est arrêté au lieu de propager une boucle sur de nombreuses continuations. Le nombre maximal de fragments successifs est désormais borné à 12.

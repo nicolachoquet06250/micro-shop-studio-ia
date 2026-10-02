@@ -11,7 +11,7 @@ const emit = defineEmits<{ close: [] }>();
 
 <template>
   <Teleport to="body">
-    <div v-if="open" class="modal-backdrop" @mousedown.self="emit('close')">
+    <div v-show="open" class="modal-backdrop" @mousedown.self="emit('close')">
       <section class="modal-card" :class="{ wide }" role="dialog" aria-modal="true" :aria-label="title">
         <header class="modal-head">
           <div>

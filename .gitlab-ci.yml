@@ -1,0 +1,30 @@
+stages:
+  - deploy
+
+deploy:
+  stage: deploy
+  image: node:22-bookworm
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends openssh-client curl ca-certificates
+    - rm -rf /var/lib/apt/lists/*
+    - install -m 700 -d ~/.ssh
+    - printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+    - ssh-keyscan -p "${SSH_PORT:-22}" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+  script:
+    - npm ci
+    - npm run build
+    - cp package.json dist/package.json
+    - cp package-lock.json dist/package-lock.json
+    - ssh -i ~/.ssh/deploy_key -p "${SSH_PORT:-22}" "$SSH_USERNAME@$SSH_HOST" "mkdir -p '$REMOTE_PATH'"
+    - scp -i ~/.ssh/deploy_key -P "${SSH_PORT:-22}" -r dist/. "$SSH_USERNAME@$SSH_HOST:$REMOTE_PATH/"
+    - ssh -i ~/.ssh/deploy_key -p "${SSH_PORT:-22}" "$SSH_USERNAME@$SSH_HOST" "cd '$REMOTE_PATH' && npm install"
+    - >-
+      curl --fail-with-body -X POST
+      --basic
+      --user "${ALWAYSDATA_API_KEY} account=${ALWAYSDATA_ACCOUNT}:"
+      "https://api.alwaysdata.com/v1/site/${ALWAYSDATA_SITE_ID}/restart/"
