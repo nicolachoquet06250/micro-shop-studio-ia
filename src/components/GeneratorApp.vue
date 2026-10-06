@@ -29,6 +29,23 @@ const generating = ref(false);
 const logs = ref<GenerationLog[]>([]);
 const result = ref<GenerationResult | null>(null);
 const error = ref('');
+const retryFailedStep = ref<(() => void) | null>(null);
+
+function waitForStepRetry(_stage: string, message: string, signal: AbortSignal): Promise<boolean> {
+  error.value = message;
+  return new Promise((resolve) => {
+    const finish = (retry: boolean) => {
+      signal.removeEventListener('abort', cancel);
+      retryFailedStep.value = null;
+      if (retry) error.value = '';
+      resolve(retry);
+    };
+    const cancel = () => finish(false);
+    retryFailedStep.value = () => finish(true);
+    if (signal.aborted) cancel();
+    else signal.addEventListener('abort', cancel, { once: true });
+  });
+}
 const abortController = ref<AbortController | null>(null);
 const stepController = new GenerationStepController();
 const activeGenerationStep = ref<string | null>(null);
@@ -657,6 +674,7 @@ async function startGeneration() {
         onAiTrace: handleAiTrace,
         stepController,
         onStepState: onGenerationStepState,
+        onStepError: waitForStepRetry,
       },
     );
     generated = true;
@@ -1020,6 +1038,7 @@ async function downloadProject() {
           <pre class="reasoning-live">{{ liveReasoningPreview || (liveStreamPreview ? 'Raisonnement non exposé par cette requête — réponse finale en cours…' : 'En attente du raisonnement…') }}</pre>
         </div>
         <div v-if="error" class="error-box">{{ error }}</div>
+        <button v-if="retryFailedStep" type="button" class="secondary" @click="retryFailedStep?.()">Ressayer l'étape</button>
         <div v-if="result" class="result-box"><strong>{{ result.files.length }} fichiers générés</strong><span>Validation : {{ validationStatusLabel }} · le projet reste disponible indépendamment des tests.</span></div>
         <div v-if="generating && activeGenerationStep" class="step-actions">
           <button type="button" class="step-restart" :disabled="Boolean(stepActionPending)" @click="restartCurrentStep">

@@ -123,6 +123,7 @@ async function generateFixedFile(
       onInfo: (message) => emitValidation(callbacks, 'repair', message),
     });
     const result = await chatCompletion(settings, fittedMessages, {
+      continueOnLength: false,
       thinking: false,
       signal: callbacks.signal,
       trace: { stage: correctionStage, kind: 'validation-file' },

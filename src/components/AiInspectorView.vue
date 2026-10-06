@@ -376,6 +376,13 @@ function statusLabel(status: AiCallTrace['status']) {
       </div>
 
       <div v-else class="tab-panel block output-block">
+        <div v-if="selectedTrace.reasoning" class="reasoning-panel">
+          <div class="block-title">
+            <strong>Raisonnement IA</strong>
+            <span>{{ selectedTrace.reasoningChars.toLocaleString('fr-FR') }} caractères</span>
+          </div>
+          <pre>{{ selectedTrace.reasoning }}</pre>
+        </div>
         <div class="block-title">
           <strong>Sortie finale reconstituée</strong>
           <span>{{ selectedTrace.output.length.toLocaleString('fr-FR') }} caractères</span>

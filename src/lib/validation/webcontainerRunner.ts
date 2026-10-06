@@ -339,7 +339,7 @@ export class WebContainerRunner implements RuntimeRunner {
       };
     } finally {
       if (timeoutId !== null) window.clearTimeout(timeoutId);
-      unsubscribe?.();
+      (unsubscribe as unknown as (() => null))?.();
       process?.kill();
     }
   }

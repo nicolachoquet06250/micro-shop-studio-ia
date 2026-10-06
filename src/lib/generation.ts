@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
-import type { AiCallTraceEvent, AiPromptPreview, AiSettings, GeneratedFile, GenerationResult, GeneratorForm, GenerationLog } from '../types/generator';
+import type { AiCallTraceEvent, AiPromptPreview, AiSettings, GenerationResult, GeneratorForm, GenerationLog } from '../types/generator';
+import type { DegenerationFinding } from './generationGuard';
 import { chatCompletion, parseJsonResponse, type ChatMessage, type ChatTextPart, type ChatImagePart } from './openai';
 import { buildNetworkManifest, embeddedNetworkFiles, networkContext } from './network';
 import { buildProjectInput } from './projectInput';
@@ -109,6 +110,7 @@ export class GenerationStepController {
 }
 
 interface GenerateCallbacks {
+  onStepError?: (stage: string, message: string, signal: AbortSignal) => Promise<boolean>;
   onLog?: (entry: GenerationLog) => void;
   onStream?: (event: GenerationStreamEvent) => void;
   onAiTrace?: (event: AiCallTraceEvent) => void;
@@ -969,6 +971,14 @@ async function callJson<T>(
         continue;
       }
 
+      const message = error instanceof Error ? error.message : String(error);
+      if (/→\s*500\b|\bHTTP\s*500\b/i.test(message) && callbacks.onStepError) {
+        emit(callbacks, stage, 'error', message);
+        if (await callbacks.onStepError(stage, message, guardController.signal)) {
+          emit(callbacks, stage, 'info', 'Nouvelle tentative de l’étape après erreur 500.');
+          continue;
+        }
+      }
       const action = consumeStepAction(callbacks, stage);
       if (action === 'restart') {
         emit(callbacks, stage, 'info', `${stage} annulé puis relancé à la demande de l’utilisateur.`);
@@ -1155,6 +1165,7 @@ async function callFileContent(
         onInfo: (message) => emit(callbacks, stage, 'info', message),
       });
       result = await chatCompletion(settings, fittedMessages, {
+        continueOnLength: false,
         thinking: false,
         signal: guardController.signal,
         trace: { stage: tracePartStage, kind: part === 1 ? 'file' : 'file-continuation' },
@@ -1197,8 +1208,9 @@ async function callFileContent(
         },
       });
     } catch (error) {
-      if ((degenerationFinding as {code: any, reason: any, sample: any} | null)) {
+      if (degenerationFinding) {
         recoveryAttempts += 1;
+        const df = degenerationFinding as unknown as DegenerationFinding;
         recordGenerationHealth(callbacks, {
           stage,
           kind: 'file',
@@ -1206,9 +1218,9 @@ async function callFileContent(
           fragment: part,
           recoveryAttempt: recoveryAttempts,
           status: 'detected',
-          reasonCode: degenerationFinding.code,
-          reason: degenerationFinding.reason,
-          sample: degenerationFinding.sample,
+          reasonCode: df.code,
+          reason: df.reason,
+          sample: df.sample,
           generatedChars: lastGuardCheckLength,
           checkpointChars: accumulatedFile.length,
         });
@@ -1216,13 +1228,13 @@ async function callFileContent(
           callbacks,
           stage,
           'error',
-          `${path} (fragment ${part}) : boucle/dégénérescence détectée (${degenerationFinding.reason}). ` +
+          `${path} (fragment ${part}) : boucle/dégénérescence détectée (${df.reason}). ` +
           `Le fragment corrompu est rejeté et la reprise repart du dernier checkpoint sain (${recoveryAttempts}/${FILE_DEGENERATION_MAX_RECOVERIES}).`,
         );
         if (recoveryAttempts > FILE_DEGENERATION_MAX_RECOVERIES) {
           recordGenerationHealth(callbacks, {
             stage, kind: 'file', target: path, fragment: part, recoveryAttempt: FILE_DEGENERATION_MAX_RECOVERIES, status: 'failed',
-            reasonCode: degenerationFinding.code, reason: degenerationFinding.reason, sample: degenerationFinding.sample,
+            reasonCode: df.code, reason: df.reason, sample: df.sample,
             generatedChars: lastGuardCheckLength, checkpointChars: accumulatedFile.length,
           });
           throw new Error(`${path}: dégénérescence répétée malgré ${FILE_DEGENERATION_MAX_RECOVERIES} récupérations automatiques sur le fragment ${part}. Génération arrêtée avant contamination des fragments suivants.`);
@@ -1230,10 +1242,18 @@ async function callFileContent(
         const safeMessages = part === 1
           ? initialMessages
           : continuationMessages(path, accumulatedFile, part, additionalSystemRules);
-        messages = withRecoveryInstruction(safeMessages, degenerationFinding.reason, recoveryAttempts, `${path} · fragment ${part}`);
+        messages = withRecoveryInstruction(safeMessages, df.reason, recoveryAttempts, `${path} · fragment ${part}`);
         continue;
       }
 
+      const message = error instanceof Error ? error.message : String(error);
+      if (/→\s*500\b|\bHTTP\s*500\b/i.test(message) && callbacks.onStepError) {
+        emit(callbacks, stage, 'error', message);
+        if (await callbacks.onStepError(stage, message, guardController.signal)) {
+          emit(callbacks, stage, 'info', 'Nouvelle tentative du fragment après erreur 500.');
+          continue;
+        }
+      }
       const action = consumeStepAction(callbacks, stage);
       if (action === 'restart') {
         emit(callbacks, stage, 'info', `${path}: requête annulée puis relancée à la demande de l’utilisateur.`);
@@ -1445,6 +1465,17 @@ export async function generateShop(
   const projectInput = buildProjectInput(form);
   const i18nContext = buildI18nApplicationContext(form);
   const i18nRules = i18nPromptRules(i18nContext);
+  const exhaustiveTestingRules = `===== EXHAUSTIVITÉ IMPÉRATIVE DES EXIGENCES ET CAS DE TEST =====
+- Les exigences doivent être EXHAUSTIVES par rapport à l'intégralité des spécifications, règles métier, parcours, contraintes techniques, sécurité, intégrations, i18n, SEO et comportements applicables au projet.
+- Il n'existe AUCUN plafond arbitraire du nombre d'exigences : ne te limite jamais à 20, 40, 50, 100 ou à tout autre nombre prédéfini ou nombre rond. Continue jusqu'à ce que tout le périmètre applicable soit couvert.
+- Ne fournis jamais un échantillon, une sélection représentative, un résumé ou seulement les exigences principales. Chaque exigence distincte et vérifiable doit être identifiée explicitement.
+- Les cas de test dérivés de ces exigences doivent eux aussi être EXHAUSTIFS. Chaque exigence doit être reliée à tous les cas nécessaires pour vérifier complètement son comportement.
+- Pour chaque exigence, couvre toutes les variantes pertinentes : parcours nominal, erreurs, validations, valeurs limites, états/transitions, droits et rôles, sécurité, données absentes ou invalides, intégrations, échecs externes et cas particuliers imposés par les spécifications.
+- Une exigence ne doit jamais être considérée couverte parce qu'un seul cas de test existe si plusieurs scénarios distincts sont nécessaires pour la vérifier complètement.
+- Maintiens une traçabilité complète et bidirectionnelle REQ -> TC -> tests exécutables et tests -> TC -> REQ.
+- Avant de terminer, effectue une vérification de couverture : aucune fonctionnalité/règle/contrainte applicable ne doit rester sans REQ, aucune REQ sans cas suffisants, et aucun cas prévu sans lien explicite vers son exigence.
+- L'arrêt de la génération est déterminé UNIQUEMENT par la couverture exhaustive du périmètre, jamais par un nombre d'éléments atteint.
+===== FIN EXHAUSTIVITÉ IMPÉRATIVE =====`;
   const repositoryContext = buildExistingRepositoryContext(form);
   const repositoryRules = existingRepositoryPrompt(repositoryContext);
   const repositoryImplementationRules = repositoryContext.enabled
@@ -1614,7 +1645,7 @@ export async function generateShop(
   artifacts.TEST_PLAN = await callJson<unknown>(
     settings,
     ['agents/13b-micro-shop-testing-engineer.agent.md', 'skills/testing-engineer/SKILL.md', 'contracts/testing-contract.md'],
-    `Produis TEST_PLAN avant implémentation. Tu ne peux pas exécuter les futurs tests dans ce navigateur : planifie les tests exécutables et marque toute preuve d'exécution comme pending. Si l’i18n est activée, ajoute obligatoirement des tests garantissant que chaque fichier de traduction de chaque langue sélectionnée possède exactement le même ensemble de clés que les clés réellement utilisées dans les fichiers source de l’application et que les principaux écrans n’embarquent pas de wording statique à la place de clés i18n.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
+    `Produis TEST_PLAN avant implémentation. Tu ne peux pas exécuter les futurs tests dans ce navigateur : planifie les tests exécutables et marque toute preuve d'exécution comme pending. IMPORTANT : TEST_PLAN, les exigences et les cas de test ne sont PAS des exemples, un résumé ou un échantillon ; ils doivent couvrir exhaustivement tout le périmètre applicable, sans plafond arbitraire de quantité. Si l’i18n est activée, ajoute obligatoirement des tests garantissant que chaque fichier de traduction de chaque langue sélectionnée possède exactement le même ensemble de clés que les clés réellement utilisées dans les fichiers source de l’application et que les principaux écrans n’embarquent pas de wording statique à la place de clés i18n.\n${exhaustiveTestingRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
     callbacks,
     'plan de tests',
   );
@@ -1622,7 +1653,7 @@ export async function generateShop(
   const buildPlan = await callJson<BuildPlan>(
     settings,
     ['agents/09-micro-shop-implementation-orchestrator.agent.md', 'contracts/artifact-layout.md'],
-    `Prépare un plan de génération de fichiers concret, borné et ordonné. Réponds {"batches":[{"id":"B1","objective":"...","owner":"frontoffice-builder|backoffice-builder|backend-builder|implementation-orchestrator","files":["path"],"contextPaths":["path déjà généré utile"]}],"i18n":{"enabled":true,"defaultLocale":"fr","locales":[{"code":"fr","resourceFiles":["path"]}],"configFiles":["path"],"verificationFiles":["path"]},"notes":[]}. Si l’i18n est désactivée, utilise {"enabled":false,"locales":[]}. Si elle est activée, i18n.defaultLocale doit être EXACTEMENT la langue par défaut de I18N_SPEC et doit appartenir à i18n.locales ; i18n.locales doit contenir EXACTEMENT toutes les langues de I18N_SPEC, chacune avec EXACTEMENT UN chemin dans resourceFiles. Ce fichier de traduction par locale devra contenir le jeu COMPLET des clés réellement utilisées dans les fichiers source de l’application, et toutes les locales devront avoir STRICTEMENT le même ensemble de clés. IMPORTANT: les fichiers de traduction déclarés dans resourceFiles sont générés par l'application hôte dans une PHASE I18N FINALE, après toutes les pages, composants, layouts, services et routes API : NE LES INCLUS PAS dans batches. Utilise obligatoirement un fichier de catalogue dédié, unique et distinct par locale, de préférence JSON ; si tu choisis TS/JS, la configuration doit consommer un export default. N’utilise jamais un même fichier de traduction pour plusieurs locales. Les fichiers de configuration i18n et les tests de parité/complétude, eux, doivent être prévus dans batches. Maximum ${form.output.maxBatches} lots, maximum 14 fichiers par lot. Chaque fichier de code, config, documentation et test nécessaire doit apparaître exactement une fois dans files, sauf modification ultérieure explicitement nécessaire. DATA_MODEL est un modèle logique unique et agnostique du moteur : ne crée jamais un data-model différent par environnement. Si TECH_STACK utilise plusieurs moteurs selon les environnements, prévois seulement les fichiers physiques nécessaires (configuration, adaptateurs, migrations) séparément par moteur/environnement, tous conformes au même DATA_MODEL, sans mélanger plusieurs dialectes SQL dans un même fichier. Tout diagramme documentaire doit être un fichier .md contenant un bloc Mermaid ; n'inclus jamais de .puml, .plantuml, .dot, .gv, .mmd ni d'image de diagramme. Aucun Markdown ne doit apparaître dans un fichier non-.md. Les diagrammes canoniques déjà produits dans .ai/diagrams/ ne doivent pas être recréés.\n${repositoryRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DESIGN', artifacts.DESIGN)}${artifactMessage('DATA_MODEL', artifacts.DATA_MODEL)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('SEO', artifacts.SEO ?? null)}${artifactMessage('TEST_PLAN', artifacts.TEST_PLAN)}${artifactMessage('DIAGRAMS', artifacts.DIAGRAMS)}\nINSTRUCTIONS SUPPLÉMENTAIRES UTILISATEUR:\n${form.output.extraInstructions || '(aucune)'}`,
+    `Prépare un plan de génération de fichiers concret, borné et ordonné. Les documents d'exigences et de cas de test prévus par TEST_PLAN doivent être générés intégralement : ne les tronque jamais et ne borne jamais leur nombre d'éléments sous prétexte que le plan de fichiers est borné. Réponds {"batches":[{"id":"B1","objective":"...","owner":"frontoffice-builder|backoffice-builder|backend-builder|implementation-orchestrator","files":["path"],"contextPaths":["path déjà généré utile"]}],"i18n":{"enabled":true,"defaultLocale":"fr","locales":[{"code":"fr","resourceFiles":["path"]}],"configFiles":["path"],"verificationFiles":["path"]},"notes":[]}. Si l’i18n est désactivée, utilise {"enabled":false,"locales":[]}. Si elle est activée, i18n.defaultLocale doit être EXACTEMENT la langue par défaut de I18N_SPEC et doit appartenir à i18n.locales ; i18n.locales doit contenir EXACTEMENT toutes les langues de I18N_SPEC, chacune avec EXACTEMENT UN chemin dans resourceFiles. Ce fichier de traduction par locale devra contenir le jeu COMPLET des clés réellement utilisées dans les fichiers source de l’application, et toutes les locales devront avoir STRICTEMENT le même ensemble de clés. IMPORTANT: les fichiers de traduction déclarés dans resourceFiles sont générés par l'application hôte dans une PHASE I18N FINALE, après toutes les pages, composants, layouts, services et routes API : NE LES INCLUS PAS dans batches. Utilise obligatoirement un fichier de catalogue dédié, unique et distinct par locale, de préférence JSON ; si tu choisis TS/JS, la configuration doit consommer un export default. N’utilise jamais un même fichier de traduction pour plusieurs locales. Les fichiers de configuration i18n et les tests de parité/complétude, eux, doivent être prévus dans batches. Maximum ${form.output.maxBatches} lots, maximum 14 fichiers par lot. Chaque fichier de code, config, documentation et test nécessaire doit apparaître exactement une fois dans files, sauf modification ultérieure explicitement nécessaire. DATA_MODEL est un modèle logique unique et agnostique du moteur : ne crée jamais un data-model différent par environnement. Si TECH_STACK utilise plusieurs moteurs selon les environnements, prévois seulement les fichiers physiques nécessaires (configuration, adaptateurs, migrations) séparément par moteur/environnement, tous conformes au même DATA_MODEL, sans mélanger plusieurs dialectes SQL dans un même fichier. Tout diagramme documentaire doit être un fichier .md contenant un bloc Mermaid ; n'inclus jamais de .puml, .plantuml, .dot, .gv, .mmd ni d'image de diagramme. Aucun Markdown ne doit apparaître dans un fichier non-.md. Les diagrammes canoniques déjà produits dans .ai/diagrams/ ne doivent pas être recréés.\n${repositoryRules}\n${exhaustiveTestingRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DESIGN', artifacts.DESIGN)}${artifactMessage('DATA_MODEL', artifacts.DATA_MODEL)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('SEO', artifacts.SEO ?? null)}${artifactMessage('TEST_PLAN', artifacts.TEST_PLAN)}${artifactMessage('DIAGRAMS', artifacts.DIAGRAMS)}\nINSTRUCTIONS SUPPLÉMENTAIRES UTILISATEUR:\n${form.output.extraInstructions || '(aucune)'}`,
     callbacks,
     'plan de génération',
   );
@@ -1702,6 +1733,7 @@ export async function generateShop(
         (i18nContext.enabled
           ? `- INTERNATIONALISATION OBLIGATOIRE: tous les wordings statiques visibles par l’utilisateur doivent utiliser des clés i18n stables et hiérarchiques dans le code ; aucune chaîne UI brute. NE GÉNÈRE PAS de catalogue de traduction dans ce fichier sauf si ${safePath} est explicitement un resourceFiles du BUILD_PLAN : les catalogues sont différés jusqu'à la phase i18n finale, après toutes les pages, composants et routes API.\n`
           : '') +
+        `${exhaustiveTestingRules}\n` +
         `${repositoryImplementationRules}\n` +
         `${artifactMessage('I18N_SPEC', i18nContext)}` +
         `${artifactMessage('PROJECT_SPEC', projectSpec)}` +

@@ -120,7 +120,7 @@ export function applyReasoningPayload(
   enabled: boolean,
 ): void {
   if (strategy === 'reasoning_effort') {
-    payload.reasoning_effort = enabled ? 'medium' : 'none';
+    payload.reasoning_effort = enabled ? 'medium' : 'low';
   } else if (strategy === 'vllm') {
     payload.chat_template_kwargs = { enable_thinking: enabled };
   }

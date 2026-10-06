@@ -72,6 +72,8 @@ export interface ChatCompletionRetryInfo {
 }
 
 export interface ChatCompletionOptions {
+  /** False when the caller already manages file checkpoints and continuation. */
+  continueOnLength?: boolean;
   json?: boolean;
   /** Intention métier : reasoning actif pour la conception, inactif pour l'exécution. */
   thinking?: boolean;
@@ -363,6 +365,9 @@ function isResponseFormatError(message: string): boolean {
     || text.includes('structured output');
 }
 
+type TokenLimitParameter = 'max_tokens' | 'max_completion_tokens';
+const tokenLimitParameters = new Map<string, TokenLimitParameter>();
+
 async function sendCompletionWithNegotiation(
   settings: AiSettings,
   messages: ChatMessage[],
@@ -393,11 +398,31 @@ async function sendCompletionWithNegotiation(
     if (options.json) basePayload.response_format = { type: 'json_object' };
 
     const performRequest = async (payload: Record<string, unknown>) => {
+      const key = JSON.stringify([settings.baseUrl.replace(/\/+$/, ''), settings.model]);
+      const originalName: TokenLimitParameter | undefined = Object.hasOwn(payload, 'max_tokens')
+        ? 'max_tokens' : Object.hasOwn(payload, 'max_completion_tokens') ? 'max_completion_tokens' : undefined;
+      const preferredName = tokenLimitParameters.get(key) ?? originalName;
+      const body = { ...payload };
+      if (originalName && preferredName && originalName !== preferredName) {
+        body[preferredName] = body[originalName];
+        delete body[originalName];
+      }
       const trace = createTrace(settings, effectiveMessages, options, strategy, logicalAttempt);
       emitTrace(options, 'prepared', trace);
       // Rend le snapshot disponible à Vue avant que fetch démarre effectivement.
       await Promise.resolve();
-      const response = await sendChatRequest(settings, payload, options.signal);
+      let response = await sendChatRequest(settings, body, options.signal);
+      if (originalName && preferredName && [400, 422].includes(response.status)) {
+        const message = await readError(response.clone());
+        if (/\bmax_(?:completion_)?tokens\b/i.test(message)
+          && /unsupported|not supported|not allowed|unrecognized|unknown|unexpected|instead|replace|use\b/i.test(message)) {
+          const alternateName: TokenLimitParameter = preferredName === 'max_tokens' ? 'max_completion_tokens' : 'max_tokens';
+          body[alternateName] = body[preferredName];
+          delete body[preferredName];
+          response = await sendChatRequest(settings, body, options.signal);
+          if (response.ok) tokenLimitParameters.set(key, alternateName);
+        }
+      }
       return { response, trace };
     };
 
@@ -451,6 +476,76 @@ export async function chatCompletion(
   messages: ChatMessage[],
   options: ChatCompletionOptions = {},
 ): Promise<ChatCompletionResult> {
+  if (options.continueOnLength === false) return singleChatCompletion(settings, messages, options);
+
+  const maxParts = 12;
+  let content = '';
+  let reasoning = '';
+  let reasoningChars = 0;
+  let hadReasoning = false;
+  let nextMessages = messages;
+  for (let part = 1; part <= maxParts; part += 1) {
+    options.signal?.throwIfAborted();
+    const base = content;
+    const reasoningBase = reasoning;
+    const result = await singleChatCompletion(settings, nextMessages, {
+      ...options,
+      // A JSON suffix is not a standalone JSON object: disable JSON mode on resumed calls.
+      json: part === 1 ? options.json : false,
+      thinking: part === 1 ? options.thinking : false,
+      trace: options.trace && {
+        ...options.trace,
+        stage: part === 1 ? options.trace.stage : `${options.trace.stage} · continuation ${part}`,
+      },
+      onTrace: (event) => options.onTrace?.({
+        ...event,
+        trace: {
+          ...event.trace,
+          json: Boolean(options.json),
+          output: mergeCompletion(base, event.trace.output),
+          reasoning: reasoningBase + event.trace.reasoning,
+          reasoningChars: reasoningChars + event.trace.reasoningChars,
+          hadReasoning: hadReasoning || event.trace.hadReasoning,
+        },
+      }),
+      onDelta: (delta, fragment) => options.onDelta?.(delta, mergeCompletion(base, fragment)),
+      onReasoningDelta: (delta, fragment) => options.onReasoningDelta?.(delta, reasoningBase + fragment),
+    });
+    content = mergeCompletion(base, result.content);
+    reasoning += result.reasoning;
+    reasoningChars += result.reasoningChars;
+    hadReasoning ||= result.hadReasoning;
+    if (result.finishReason !== 'length') {
+      if (options.json) parseJsonResponse(content);
+      return { ...result, content, reasoning, reasoningChars, hadReasoning };
+    }
+    if (content.length === base.length) throw new Error('Continuation IA sans progression après finish_reason=length.');
+    // Only send the tail, so a response larger than the input context can still be resumed.
+    nextMessages = [
+      { role: 'system', content: [
+        'La réponse précédente a été interrompue par la limite de sortie (finish_reason=length).',
+        'Continue exactement cette réponse au caractère suivant, sans répéter, résumer ou recommencer.',
+        options.json ? 'Continue le JSON ouvert, y compris une chaîne inachevée. Ne crée pas un nouvel objet JSON.' : 'Conserve le format et la structure de la réponse commencée.',
+        'Retourne uniquement la suite manquante, sans introduction ni nouvelle fence Markdown.',
+      ].join('\n') },
+      { role: 'user', content: `Fin exacte déjà produite (ne pas répéter):\n${content.slice(-16_000)}\n\nPoursuis immédiatement après le dernier caractère de cette fin.` },
+    ];
+  }
+  throw new Error(`Réponse IA toujours tronquée après ${maxParts} fragments (finish_reason=length, ${content.length} caractères).`);
+}
+
+function mergeCompletion(base: string, fragment: string): string {
+  for (let size = Math.min(8_000, base.length, fragment.length); size >= 24; size -= 1) {
+    if (base.endsWith(fragment.slice(0, size))) return base + fragment.slice(size);
+  }
+  return base + fragment;
+}
+
+async function singleChatCompletion(
+  settings: AiSettings,
+  messages: ChatMessage[],
+  options: ChatCompletionOptions = {},
+): Promise<ChatCompletionResult> {
   const MAX_EMPTY_COMPLETION_ATTEMPTS = 3;
 
   for (let attempt = 1; attempt <= MAX_EMPTY_COMPLETION_ATTEMPTS; attempt += 1) {
@@ -479,26 +574,19 @@ export async function chatCompletion(
 
     const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
     let result: ChatCompletionResult;
-    let lastTraceSize = 0;
     const tracedDelta = (delta: string, accumulated: string) => {
       options.onDelta?.(delta, accumulated);
       trace.status = 'streaming';
       trace.output = accumulated;
-      if (accumulated.length - lastTraceSize >= 1200) {
-        lastTraceSize = accumulated.length;
-        emitTrace(options, 'streaming', trace);
-      }
+      emitTrace(options, 'streaming', trace);
     };
-    let lastReasoningTraceSize = 0;
     const tracedReasoningDelta = (delta: string, accumulated: string) => {
       options.onReasoningDelta?.(delta, accumulated);
       trace.status = 'streaming';
       trace.reasoning = accumulated;
       trace.reasoningChars = accumulated.length;
-      if (accumulated.length - lastReasoningTraceSize >= 1200) {
-        lastReasoningTraceSize = accumulated.length;
-        emitTrace(options, 'streaming', trace);
-      }
+      trace.hadReasoning = true;
+      emitTrace(options, 'streaming', trace);
     };
 
     try {
