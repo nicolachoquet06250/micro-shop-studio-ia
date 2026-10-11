@@ -59,6 +59,15 @@ export function buildProjectInput(form: GeneratorForm) {
       containerization: optional(form.technical.containerization),
       versioning: optional(form.technical.versioning),
       rendering: optional(form.technical.rendering),
+      mcp: form.business.mcpServer
+        ? sourced({
+            enabled: true,
+            required_tools: [...form.business.mcpTools],
+            required_capabilities: [...form.business.mcpTools],
+            transport_constraints: null,
+            compatibility_constraints: null,
+          })
+        : sourced({ enabled: false, required_tools: [], required_capabilities: [] }),
     },
     visual_inputs: {
       desktop: sourced(form.visuals.assets.some((a) => a.viewport === 'desktop')),

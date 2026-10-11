@@ -162,6 +162,11 @@ interface I18nApplicationContext {
   requirements: string[];
 }
 
+interface McpApplicationContext {
+  enabled: boolean;
+  tools: string[];
+}
+
 interface DataModelArtifact {
   [key: string]: unknown;
 }
@@ -358,6 +363,29 @@ function finishControlledStep(callbacks: GenerateCallbacks, stage: string) {
 
 function consumeStepAction(callbacks: GenerateCallbacks, stage: string): GenerationStepAction | null {
   return callbacks.stepController?.consumeAction(stage) ?? null;
+}
+
+function buildMcpApplicationContext(form: GeneratorForm): McpApplicationContext {
+  return {
+    enabled: form.business.mcpServer,
+    tools: form.business.mcpServer ? [...new Set(form.business.mcpTools.map((tool) => tool.trim()).filter(Boolean))] : [],
+  };
+}
+
+function mcpPromptRules(context: McpApplicationContext): string {
+  if (!context.enabled) return 'SERVEUR MCP: désactivé explicitement dans le formulaire. Ne crée pas de serveur MCP.';
+  return [
+    '===== SERVEUR MCP OBLIGATOIRE =====',
+    '- La création d’un serveur Model Context Protocol (MCP) conforme à la spécification officielle est une exigence EXPLICITE de l’utilisateur.',
+    '- Le serveur MCP doit être intégré au backend réel de la boutique et réutiliser les mêmes services métier, règles de sécurité, permissions, transactions et sources de vérité que les autres interfaces.',
+    `- TOOLS MCP EXPLICITEMENT SÉLECTIONNÉS PAR L’UTILISATEUR: ${stableJson(context.tools)}.`,
+    '- Chacun de ces tools doit être effectivement conçu, implémenté, documenté et testé. Ne supprime, ne renomme et n’oublie aucun tool sélectionné.',
+    '- N’ajoute pas arbitrairement d’autres tools publics non demandés. Si une capacité technique interne est indispensable, garde-la interne ou documente clairement pourquoi elle est nécessaire.',
+    '- Respecte les schémas d’entrée/sortie, l’authentification, l’autorisation, l’isolation des données, l’idempotence et les confirmations nécessaires aux mutations sensibles.',
+    '- Pour tout achat/paiement, aucun credential de paiement sensible ne doit transiter dans les arguments ou résultats MCP ; réutilise le fournisseur et les services checkout existants.',
+    '- Le BUILD_PLAN doit inclure tous les fichiers nécessaires au serveur MCP, son intégration, sa configuration et ses tests.',
+    '===== FIN SERVEUR MCP OBLIGATOIRE =====',
+  ].join('\n');
 }
 
 function buildI18nApplicationContext(form: GeneratorForm): I18nApplicationContext {
@@ -793,17 +821,19 @@ function routingUserContent(
   projectInput: unknown,
   repositoryRules: string,
   i18nRules: string,
+  mcpRules: string,
 ): string {
-  return `Normalise l'entrée suivante en PROJECT_SPEC. Choisis aussi les agents spécialisés réellement nécessaires. La sélection i18n fournie par l’application est une contrainte explicite : PROJECT_SPEC doit la conserver exactement sans ajouter ni retirer de langue.\n\nENTRÉE FORMULAIRE:\n${stableJson(projectInput)}\n\n${repositoryRules}\n\n${i18nRules}\n\nFormat attendu: {"PROJECT_SPEC": {...}, "selectedAgents": [...], "assumptions": [...], "blockingQuestions": [...]}. Les questions ne doivent être utilisées que si l'absence d'information rend le projet impossible à générer.`;
+  return `Normalise l'entrée suivante en PROJECT_SPEC. Choisis aussi les agents spécialisés réellement nécessaires. La sélection i18n fournie par l’application est une contrainte explicite : PROJECT_SPEC doit la conserver exactement sans ajouter ni retirer de langue.\n\nENTRÉE FORMULAIRE:\n${stableJson(projectInput)}\n\n${repositoryRules}\n\n${i18nRules}\n\n${mcpRules}\n\nFormat attendu: {"PROJECT_SPEC": {...}, "selectedAgents": [...], "assumptions": [...], "blockingQuestions": [...]}. Les questions ne doivent être utilisées que si l'absence d'information rend le projet impossible à générer.`;
 }
 
 export function buildInitialPromptPreview(form: GeneratorForm, settings: AiSettings): AiPromptPreview {
   const projectInput = buildProjectInput(form);
   const i18nContext = buildI18nApplicationContext(form);
+  const mcpContext = buildMcpApplicationContext(form);
   const repositoryContext = buildExistingRepositoryContext(form);
   let messages = buildJsonMessages(
     ['agents/00-micro-shop-router.agent.md', 'agents/01-micro-shop-project-discovery.agent.md'],
-    routingUserContent(projectInput, existingRepositoryPrompt(repositoryContext), i18nPromptRules(i18nContext)),
+    routingUserContent(projectInput, existingRepositoryPrompt(repositoryContext), i18nPromptRules(i18nContext), mcpPromptRules(mcpContext)),
   );
   const previewStrategy = reasoningCandidates(settings, true)[0];
   if (previewStrategy === 'prompt') {
@@ -1390,6 +1420,7 @@ function relevantIntegrationPaths(form: GeneratorForm): string[] {
   if (form.business.payment) paths.push('agents/08a-micro-shop-payment.agent.md', 'skills/payment-security/SKILL.md');
   if (form.business.transactionalEmails) paths.push('agents/08b-micro-shop-email.agent.md', 'skills/email-delivery/SKILL.md');
   if (form.business.mediaManagement || form.visuals.assets.length) paths.push('agents/08c-micro-shop-media.agent.md', 'skills/media-pipeline/SKILL.md');
+  if (form.business.mcpServer) paths.push('agents/08f-micro-shop-mcp-server-engineer.agent.md', 'skills/mcp-server-engineering/SKILL.md', 'contracts/mcp-contract.md');
   return paths;
 }
 
@@ -1462,9 +1493,14 @@ export async function generateShop(
   if (form.project.existingRepository && !form.repository.archive) {
     throw new Error('Un ZIP de projet existant est requis lorsque « Dépôt existant » est activé.');
   }
+  if (form.business.mcpServer && form.business.mcpTools.length === 0) {
+    throw new Error('Sélectionne au moins un outil MCP lorsque la création du serveur MCP est activée.');
+  }
   const projectInput = buildProjectInput(form);
   const i18nContext = buildI18nApplicationContext(form);
   const i18nRules = i18nPromptRules(i18nContext);
+  const mcpContext = buildMcpApplicationContext(form);
+  const mcpRules = mcpPromptRules(mcpContext);
   const exhaustiveTestingRules = `===== EXHAUSTIVITÉ IMPÉRATIVE DES EXIGENCES ET CAS DE TEST =====
 - Les exigences doivent être EXHAUSTIVES par rapport à l'intégralité des spécifications, règles métier, parcours, contraintes techniques, sécurité, intégrations, i18n, SEO et comportements applicables au projet.
 - Il n'existe AUCUN plafond arbitraire du nombre d'exigences : ne te limite jamais à 20, 40, 50, 100 ou à tout autre nombre prédéfini ou nombre rond. Continue jusqu'à ce que tout le périmètre applicable soit couvert.
@@ -1484,7 +1520,7 @@ export async function generateShop(
   callbacks.generationState = { abandonedSteps: [] };
   callbacks.generationHealth = { version: 1, automaticRecoveries: 0, detections: 0, failures: 0, events: [] };
   callbacks.contextLedger = new ContextLedgerStore();
-  const artifacts: Record<string, unknown> = { I18N_SPEC: i18nContext, EXISTING_REPOSITORY: repositoryContext.enabled ? {
+  const artifacts: Record<string, unknown> = { I18N_SPEC: i18nContext, MCP_REQUEST: mcpContext, EXISTING_REPOSITORY: repositoryContext.enabled ? {
     archiveName: repositoryContext.archiveName,
     fileCount: repositoryContext.fileCount,
     textFileCount: repositoryContext.textFileCount,
@@ -1508,7 +1544,7 @@ export async function generateShop(
   const routing = await callJson<RoutingResult>(
     settings,
     ['agents/00-micro-shop-router.agent.md', 'agents/01-micro-shop-project-discovery.agent.md'],
-    routingUserContent(projectInput, repositoryRules, i18nRules),
+    routingUserContent(projectInput, repositoryRules, i18nRules, mcpRules),
     callbacks,
     'discovery / routage',
   );
@@ -1518,7 +1554,7 @@ export async function generateShop(
   const techStack = await callJson<unknown>(
     settings,
     ['agents/02-micro-shop-technology-architect.agent.md', 'skills/technology-selection/SKILL.md', 'skills/database-ownership/SKILL.md'],
-    `Produis TECH_STACK à partir de PROJECT_SPEC. Respecte les contraintes explicites et complète seulement ce qui est UNSPECIFIED. Si l’i18n est activée, choisis/configure une stratégie i18n compatible avec le framework retenu et couvrant exactement les locales demandées.\n${repositoryRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}`,
+    `Produis TECH_STACK à partir de PROJECT_SPEC. Respecte les contraintes explicites et complète seulement ce qui est UNSPECIFIED. Si l’i18n est activée, choisis/configure une stratégie i18n compatible avec le framework retenu et couvrant exactement les locales demandées.\n${repositoryRules}\n${i18nRules}\n${mcpRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}`,
     callbacks,
     'architecture technique',
   );
@@ -1527,7 +1563,7 @@ export async function generateShop(
   const implementationPlan = await callJson<unknown>(
     settings,
     ['agents/03-micro-shop-project-planner.agent.md', 'contracts/testing-contract.md', 'contracts/artifact-layout.md'],
-    `Produis IMPLEMENTATION_PLAN. Il doit inclure conception, tests avant lots, SEO si activé, agentification, implémentation, validation et boucle de correction. Si l’i18n est activée, planifie explicitement la configuration, l’utilisation systématique des clés dans le code, puis une PHASE I18N FINALE après toute l’implémentation applicative pour produire les catalogues de toutes les langues sélectionnées à partir des clés réellement utilisées, avec tests de parité.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}`,
+    `Produis IMPLEMENTATION_PLAN. Il doit inclure conception, tests avant lots, SEO si activé, agentification, implémentation, validation et boucle de correction. Si l’i18n est activée, planifie explicitement la configuration, l’utilisation systématique des clés dans le code, puis une PHASE I18N FINALE après toute l’implémentation applicative pour produire les catalogues de toutes les langues sélectionnées à partir des clés réellement utilisées, avec tests de parité.\n${i18nRules}\n${mcpRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}`,
     callbacks,
     'planification',
   );
@@ -1599,7 +1635,7 @@ export async function generateShop(
   artifacts.INTEGRATIONS = await callJson<unknown>(
     settings,
     relevantIntegrationPaths(form),
-    `Produis INTEGRATION_PLAN et, uniquement si activés, PAYMENT_SPEC, EMAIL_SPEC et MEDIA_SPEC. Si l’i18n est activée, les contenus statiques des e-mails transactionnels et autres surfaces utilisateur des intégrations doivent être localisables dans toutes les langues sélectionnées via les mêmes clés/catalogues que l’application.\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
+    `Produis INTEGRATION_PLAN et, uniquement si activés, PAYMENT_SPEC, EMAIL_SPEC et MEDIA_SPEC. Si l’i18n est activée, les contenus statiques des e-mails transactionnels et autres surfaces utilisateur des intégrations doivent être localisables dans toutes les langues sélectionnées via les mêmes clés/catalogues que l’application.\n${i18nRules}\n${mcpRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
     callbacks,
     'intégrations',
   );
@@ -1614,10 +1650,20 @@ export async function generateShop(
     );
   }
 
+  if (mcpContext.enabled) {
+    artifacts.MCP_SPEC = await callJson<unknown>(
+      settings,
+      ['agents/08f-micro-shop-mcp-server-engineer.agent.md', 'skills/mcp-server-engineering/SKILL.md', 'contracts/mcp-contract.md'],
+      `Produis MCP_SPEC pour le serveur MCP explicitement demandé. Les tools sélectionnés par l'utilisateur sont contractuels et doivent tous être présents sous leur nom exact dans capabilities.tools. N'en supprime ni n'en renomme aucun. N'ajoute pas de tool public non demandé sauf nécessité technique explicitement justifiée.\n${mcpRules}${artifactMessage('MCP_REQUEST', mcpContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('MCP_SPEC', artifacts.MCP_SPEC ?? null)}`,
+      callbacks,
+      'conception serveur MCP',
+    );
+  }
+
   artifacts.AGENTIFICATION_SPEC = await callJson<unknown>(
     settings,
     ['agents/08e-micro-shop-agentification-engineer.agent.md', 'skills/project-agentification/SKILL.md', 'contracts/agentification-contract.md'],
-    `Produis AGENTIFICATION_SPEC. Le générateur garantit ensuite lui-même la copie exhaustive de tous les agents/skills/contrats dans .agents/.\n${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}`,
+    `Produis AGENTIFICATION_SPEC. Le générateur garantit ensuite lui-même la copie exhaustive de tous les agents/skills/contrats dans .agents/.\n${mcpRules}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('MCP_SPEC', artifacts.MCP_SPEC ?? null)}`,
     callbacks,
     'agentification',
   );
@@ -1645,7 +1691,7 @@ export async function generateShop(
   artifacts.TEST_PLAN = await callJson<unknown>(
     settings,
     ['agents/13b-micro-shop-testing-engineer.agent.md', 'skills/testing-engineer/SKILL.md', 'contracts/testing-contract.md'],
-    `Produis TEST_PLAN avant implémentation. Tu ne peux pas exécuter les futurs tests dans ce navigateur : planifie les tests exécutables et marque toute preuve d'exécution comme pending. IMPORTANT : TEST_PLAN, les exigences et les cas de test ne sont PAS des exemples, un résumé ou un échantillon ; ils doivent couvrir exhaustivement tout le périmètre applicable, sans plafond arbitraire de quantité. Si l’i18n est activée, ajoute obligatoirement des tests garantissant que chaque fichier de traduction de chaque langue sélectionnée possède exactement le même ensemble de clés que les clés réellement utilisées dans les fichiers source de l’application et que les principaux écrans n’embarquent pas de wording statique à la place de clés i18n.\n${exhaustiveTestingRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
+    `Produis TEST_PLAN avant implémentation. Tu ne peux pas exécuter les futurs tests dans ce navigateur : planifie les tests exécutables et marque toute preuve d'exécution comme pending. IMPORTANT : TEST_PLAN, les exigences et les cas de test ne sont PAS des exemples, un résumé ou un échantillon ; ils doivent couvrir exhaustivement tout le périmètre applicable, sans plafond arbitraire de quantité. Si l’i18n est activée, ajoute obligatoirement des tests garantissant que chaque fichier de traduction de chaque langue sélectionnée possède exactement le même ensemble de clés que les clés réellement utilisées dans les fichiers source de l’application et que les principaux écrans n’embarquent pas de wording statique à la place de clés i18n.\n${exhaustiveTestingRules}\n${i18nRules}\n${mcpRules}${artifactMessage('MCP_SPEC', artifacts.MCP_SPEC ?? null)}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}`,
     callbacks,
     'plan de tests',
   );
@@ -1653,7 +1699,7 @@ export async function generateShop(
   const buildPlan = await callJson<BuildPlan>(
     settings,
     ['agents/09-micro-shop-implementation-orchestrator.agent.md', 'contracts/artifact-layout.md'],
-    `Prépare un plan de génération de fichiers concret, borné et ordonné. Les documents d'exigences et de cas de test prévus par TEST_PLAN doivent être générés intégralement : ne les tronque jamais et ne borne jamais leur nombre d'éléments sous prétexte que le plan de fichiers est borné. Réponds {"batches":[{"id":"B1","objective":"...","owner":"frontoffice-builder|backoffice-builder|backend-builder|implementation-orchestrator","files":["path"],"contextPaths":["path déjà généré utile"]}],"i18n":{"enabled":true,"defaultLocale":"fr","locales":[{"code":"fr","resourceFiles":["path"]}],"configFiles":["path"],"verificationFiles":["path"]},"notes":[]}. Si l’i18n est désactivée, utilise {"enabled":false,"locales":[]}. Si elle est activée, i18n.defaultLocale doit être EXACTEMENT la langue par défaut de I18N_SPEC et doit appartenir à i18n.locales ; i18n.locales doit contenir EXACTEMENT toutes les langues de I18N_SPEC, chacune avec EXACTEMENT UN chemin dans resourceFiles. Ce fichier de traduction par locale devra contenir le jeu COMPLET des clés réellement utilisées dans les fichiers source de l’application, et toutes les locales devront avoir STRICTEMENT le même ensemble de clés. IMPORTANT: les fichiers de traduction déclarés dans resourceFiles sont générés par l'application hôte dans une PHASE I18N FINALE, après toutes les pages, composants, layouts, services et routes API : NE LES INCLUS PAS dans batches. Utilise obligatoirement un fichier de catalogue dédié, unique et distinct par locale, de préférence JSON ; si tu choisis TS/JS, la configuration doit consommer un export default. N’utilise jamais un même fichier de traduction pour plusieurs locales. Les fichiers de configuration i18n et les tests de parité/complétude, eux, doivent être prévus dans batches. Maximum ${form.output.maxBatches} lots, maximum 14 fichiers par lot. Chaque fichier de code, config, documentation et test nécessaire doit apparaître exactement une fois dans files, sauf modification ultérieure explicitement nécessaire. DATA_MODEL est un modèle logique unique et agnostique du moteur : ne crée jamais un data-model différent par environnement. Si TECH_STACK utilise plusieurs moteurs selon les environnements, prévois seulement les fichiers physiques nécessaires (configuration, adaptateurs, migrations) séparément par moteur/environnement, tous conformes au même DATA_MODEL, sans mélanger plusieurs dialectes SQL dans un même fichier. Tout diagramme documentaire doit être un fichier .md contenant un bloc Mermaid ; n'inclus jamais de .puml, .plantuml, .dot, .gv, .mmd ni d'image de diagramme. Aucun Markdown ne doit apparaître dans un fichier non-.md. Les diagrammes canoniques déjà produits dans .ai/diagrams/ ne doivent pas être recréés.\n${repositoryRules}\n${exhaustiveTestingRules}\n${i18nRules}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DESIGN', artifacts.DESIGN)}${artifactMessage('DATA_MODEL', artifacts.DATA_MODEL)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('SEO', artifacts.SEO ?? null)}${artifactMessage('TEST_PLAN', artifacts.TEST_PLAN)}${artifactMessage('DIAGRAMS', artifacts.DIAGRAMS)}\nINSTRUCTIONS SUPPLÉMENTAIRES UTILISATEUR:\n${form.output.extraInstructions || '(aucune)'}`,
+    `Prépare un plan de génération de fichiers concret, borné et ordonné. Les documents d'exigences et de cas de test prévus par TEST_PLAN doivent être générés intégralement : ne les tronque jamais et ne borne jamais leur nombre d'éléments sous prétexte que le plan de fichiers est borné. Réponds {"batches":[{"id":"B1","objective":"...","owner":"frontoffice-builder|backoffice-builder|backend-builder|implementation-orchestrator","files":["path"],"contextPaths":["path déjà généré utile"]}],"i18n":{"enabled":true,"defaultLocale":"fr","locales":[{"code":"fr","resourceFiles":["path"]}],"configFiles":["path"],"verificationFiles":["path"]},"notes":[]}. Si l’i18n est désactivée, utilise {"enabled":false,"locales":[]}. Si elle est activée, i18n.defaultLocale doit être EXACTEMENT la langue par défaut de I18N_SPEC et doit appartenir à i18n.locales ; i18n.locales doit contenir EXACTEMENT toutes les langues de I18N_SPEC, chacune avec EXACTEMENT UN chemin dans resourceFiles. Ce fichier de traduction par locale devra contenir le jeu COMPLET des clés réellement utilisées dans les fichiers source de l’application, et toutes les locales devront avoir STRICTEMENT le même ensemble de clés. IMPORTANT: les fichiers de traduction déclarés dans resourceFiles sont générés par l'application hôte dans une PHASE I18N FINALE, après toutes les pages, composants, layouts, services et routes API : NE LES INCLUS PAS dans batches. Utilise obligatoirement un fichier de catalogue dédié, unique et distinct par locale, de préférence JSON ; si tu choisis TS/JS, la configuration doit consommer un export default. N’utilise jamais un même fichier de traduction pour plusieurs locales. Les fichiers de configuration i18n et les tests de parité/complétude, eux, doivent être prévus dans batches. Maximum ${form.output.maxBatches} lots, maximum 14 fichiers par lot. Chaque fichier de code, config, documentation et test nécessaire doit apparaître exactement une fois dans files, sauf modification ultérieure explicitement nécessaire. DATA_MODEL est un modèle logique unique et agnostique du moteur : ne crée jamais un data-model différent par environnement. Si TECH_STACK utilise plusieurs moteurs selon les environnements, prévois seulement les fichiers physiques nécessaires (configuration, adaptateurs, migrations) séparément par moteur/environnement, tous conformes au même DATA_MODEL, sans mélanger plusieurs dialectes SQL dans un même fichier. Tout diagramme documentaire doit être un fichier .md contenant un bloc Mermaid ; n'inclus jamais de .puml, .plantuml, .dot, .gv, .mmd ni d'image de diagramme. Aucun Markdown ne doit apparaître dans un fichier non-.md. Les diagrammes canoniques déjà produits dans .ai/diagrams/ ne doivent pas être recréés.\n${repositoryRules}\n${exhaustiveTestingRules}\n${exhaustiveTestingRules}\n${i18nRules}\n${mcpRules}${artifactMessage('MCP_SPEC', artifacts.MCP_SPEC ?? null)}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('IMPLEMENTATION_PLAN', implementationPlan)}${artifactMessage('DESIGN', artifacts.DESIGN)}${artifactMessage('DATA_MODEL', artifacts.DATA_MODEL)}${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}${artifactMessage('SECURITY_MODEL', artifacts.SECURITY_MODEL)}${artifactMessage('INTEGRATIONS', artifacts.INTEGRATIONS)}${artifactMessage('SEO', artifacts.SEO ?? null)}${artifactMessage('TEST_PLAN', artifacts.TEST_PLAN)}${artifactMessage('DIAGRAMS', artifacts.DIAGRAMS)}\nINSTRUCTIONS SUPPLÉMENTAIRES UTILISATEUR:\n${form.output.extraInstructions || '(aucune)'}`,
     callbacks,
     'plan de génération',
   );
@@ -1668,9 +1714,11 @@ export async function generateShop(
   for (const [batchIndex, batch] of batches.entries()) {
     assertNotAborted(callbacks.signal);
     const agentPath = ownerAgent(batch.owner);
+    const mcpBatchRelevant = mcpContext.enabled && /mcp/i.test(`${batch.id} ${batch.objective} ${batch.owner} ${batch.files.join(' ')}`);
     const systemPaths = [
       'agents/09-micro-shop-implementation-orchestrator.agent.md',
       agentPath,
+      ...(mcpBatchRelevant ? ['agents/08f-micro-shop-mcp-server-engineer.agent.md', 'skills/mcp-server-engineering/SKILL.md', 'contracts/mcp-contract.md'] : []),
       'agents/13b-micro-shop-testing-engineer.agent.md',
     ];
 
@@ -1734,8 +1782,10 @@ export async function generateShop(
           ? `- INTERNATIONALISATION OBLIGATOIRE: tous les wordings statiques visibles par l’utilisateur doivent utiliser des clés i18n stables et hiérarchiques dans le code ; aucune chaîne UI brute. NE GÉNÈRE PAS de catalogue de traduction dans ce fichier sauf si ${safePath} est explicitement un resourceFiles du BUILD_PLAN : les catalogues sont différés jusqu'à la phase i18n finale, après toutes les pages, composants et routes API.\n`
           : '') +
         `${exhaustiveTestingRules}\n` +
+        `${mcpRules}\n` +
         `${repositoryImplementationRules}\n` +
         `${artifactMessage('I18N_SPEC', i18nContext)}` +
+        `${artifactMessage('MCP_SPEC', artifacts.MCP_SPEC ?? null)}` +
         `${artifactMessage('PROJECT_SPEC', projectSpec)}` +
         `${artifactMessage('TECH_STACK', techStack)}` +
         `${artifactMessage('DOMAIN_MODEL', artifacts.DOMAIN_MODEL)}` +
@@ -1776,6 +1826,7 @@ export async function generateShop(
   // déterministes tout en respectant les chemins canoniques du réseau.
   files.set('.ai/project-spec.yaml', stableJson(projectSpec));
   files.set('.ai/i18n-spec.yaml', stableJson(i18nContext));
+  if (mcpContext.enabled && artifacts.MCP_SPEC) files.set('.ai/mcp-spec.yaml', stableJson(artifacts.MCP_SPEC));
   files.set('.ai/technology-stack.yaml', stableJson(techStack));
   files.set('.ai/implementation-plan.yaml', stableJson(implementationPlan));
   files.set('.ai/design-system.yaml', stableJson(artifacts.DESIGN));
@@ -1835,7 +1886,7 @@ export async function generateShop(
   const report = await callJson<unknown>(
     settings,
     ['agents/16-micro-shop-final-reporter.agent.md'],
-    `Produis le compte rendu final de génération avant validation runtime. À ce stade, marque les tests/validations comme PENDING : l'application hôte exécutera ensuite les commandes réellement supportées dans ses runtimes navigateur. Indique les commandes à exécuter, les fichiers générés et les points à valider sans inventer de résultat.\n${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('I18N_SPEC', i18nContext)}\nFICHIERS GÉNÉRÉS:\n${stableJson(fileManifest)}`,
+    `Produis le compte rendu final de génération avant validation runtime. À ce stade, marque les tests/validations comme PENDING : l'application hôte exécutera ensuite les commandes réellement supportées dans ses runtimes navigateur. Indique les commandes à exécuter, les fichiers générés et les points à valider sans inventer de résultat.\n${artifactMessage('PROJECT_SPEC', projectSpec)}${artifactMessage('TECH_STACK', techStack)}${artifactMessage('I18N_SPEC', i18nContext)}${artifactMessage('MCP_SPEC', artifacts.MCP_SPEC ?? null)}\nFICHIERS GÉNÉRÉS:\n${stableJson(fileManifest)}`,
     callbacks,
     'rapport final',
   );

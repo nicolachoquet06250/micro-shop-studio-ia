@@ -28,6 +28,8 @@ export function createDefaultForm(): GeneratorForm {
       mediaManagement: true,
       seo: true,
       internationalization: false,
+      mcpServer: false,
+      mcpTools: [],
       locales: ['fr', 'en'],
       defaultLocale: 'fr',
       currency: 'EUR',

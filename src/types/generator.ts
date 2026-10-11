@@ -60,6 +60,8 @@ export interface GeneratorForm {
     mediaManagement: boolean;
     seo: boolean;
     internationalization: boolean;
+    mcpServer: boolean;
+    mcpTools: string[];
     locales: string[];
     defaultLocale: string;
     currency: string;
