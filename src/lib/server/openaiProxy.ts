@@ -70,6 +70,9 @@ export async function proxyOpenAiRequest(input: OpenAiProxyRequest): Promise<Res
           ? 'text/event-stream, application/json'
           : 'application/json',
         Authorization: `Bearer ${input.apiKey}`,
+        ...(new URL(baseUrl).hostname === 'api.anthropic.com'
+          ? { 'anthropic-version': '2023-06-01' }
+          : {}),
         ...(input.method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
       },
       body: input.method === 'POST' ? JSON.stringify(input.body ?? {}) : undefined,
