@@ -2,6 +2,7 @@ package main
 
 import (
  "embed"
+ "io/fs"
  "log"
  "net/http"
 
@@ -14,14 +15,22 @@ import (
 var assets embed.FS
 
 func main() {
- err := wails.Run(&options.App{
+ static,err:=fs.Sub(assets,"frontend/dist")
+ if err!=nil{log.Fatal(err)}
+ bridge,err:=NewBridge()
+ if err!=nil{log.Fatal(err)}
+ defer bridge.Close()
+ err = wails.Run(&options.App{
   Title: "Micro Shop Studio",
   Width: 1380,
   Height: 900,
+  MinWidth: 960,
+  MinHeight: 640,
+  Bind: []interface{}{bridge},
   AssetServer: &assetserver.Options{
-   Assets: assets,
+   Assets: static,
    Handler: http.HandlerFunc(handleAPI),
   },
  })
- if err != nil { log.Fatal(err) }
+ if err != nil {log.Fatal(err)}
 }
