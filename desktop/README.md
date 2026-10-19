@@ -50,3 +50,38 @@ Chrome/Firefox de bureau : la parité des validateurs doit être vérifiée
 sur les trois OS, notamment pour `SharedArrayBuffer` et la cross-origin
 isolation. Les builds réussis ne constituent pas à eux seuls une preuve
 de compatibilité de tous les validateurs en exécution.
+
+## Packages GitHub (GHCR)
+
+Sur chaque push réussi vers `main`, après réussite des builds des trois systèmes,
+la CI publie les archives portables au format **OCI artifact** dans GitHub Packages,
+sans créer de GitHub Release. Les artefacts Actions restent disponibles.
+
+Package : `ghcr.io/nicolachoquet06250/micro-shop-studio-ia/micro-shop-studio-desktop`
+
+Tags remplacés automatiquement par le prochain build réussi :
+
+- `linux-x64-latest`
+- `windows-x64-latest`
+- `macos-arm64-latest`
+
+Chaque compilation est aussi accessible par `sha-<commit>-<plateforme>`.
+Ces tags précis restent stables ; le registre peut conserver les blobs anciens
+jusqu'à suppression ou à l'application d'une politique de rétention.
+
+Exemple pour récupérer le binaire Linux :
+
+```sh
+oras pull ghcr.io/nicolachoquet06250/micro-shop-studio-ia/micro-shop-studio-desktop:linux-x64-latest
+tar -xzf artifacts/micro-shop-studio-linux-x64/packages/micro-shop-studio-linux-x64.tar.gz
+```
+
+L'archive est publiée dans GHCR sous le nom de fichier et l'arborescence
+`artifacts/micro-shop-studio-<plateforme>/packages/` indiqués ci-dessus.
+L'accès au package dépend de sa visibilité GHCR (public/privé).
+Si besoin, se connecter avec `oras login ghcr.io`.
+
+Le job de publication ne s'exécute jamais sur une PR ; il nécessite
+`packages: write` et un `GITHUB_TOKEN` autorisé. Avant publication,
+il vérifie que son commit correspond toujours au HEAD de `main` afin
+qu'un build ancien ne remplace pas accidentellement les tags `latest`.

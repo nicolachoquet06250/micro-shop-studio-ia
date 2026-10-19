@@ -67,11 +67,87 @@ jobs:
           else
             "$WAILS" build -clean -s -skipbindings
           fi
+      - name: Package portable executable (preserve executable permissions)
+        shell: bash
+        run: |
+          mkdir -p desktop/build/packages
+          tar -czf "desktop/build/packages/micro-shop-studio-${{ matrix.name }}.tar.gz" -C desktop/build/bin .
+
       - name: Upload desktop executable
         uses: actions/upload-artifact@v4
         with:
           name: micro-shop-studio-${{ matrix.name }}
           path: |
             desktop/build/bin/**
+            desktop/build/packages/**
           if-no-files-found: error
           retention-days: 14
+
+  publish-ghcr:
+    name: Publish desktop packages to GHCR
+    needs: desktop
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: desktop-ghcr-publication
+      cancel-in-progress: false
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: micro-shop-studio-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Install ORAS CLI
+        uses: oras-project/setup-oras@v2
+
+      - name: Sign in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish only if this is still the latest main commit
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" | jq -r '.object.sha')"
+          if [[ "$current" == "$GITHUB_SHA" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping stale build: main moved to $current"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish Linux, Windows and macOS OCI artifacts
+        if: steps.latest.outputs.publish == 'true'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPOSITORY,,}/micro-shop-studio-desktop"
+          for platform in linux-x64 windows-x64 macos-arm64; do
+            archive="artifacts/micro-shop-studio-${platform}/packages/micro-shop-studio-${platform}.tar.gz"
+            test -s "$archive"
+            version="sha-${COMMIT_SHA}-${platform}"
+            latest="${platform}-latest"
+            oras push "${image}:${version}" \
+              --artifact-type "application/vnd.micro-shop-studio.desktop.v1" \
+              --annotation "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+              --annotation "org.opencontainers.image.revision=${COMMIT_SHA}" \
+              --annotation "org.opencontainers.image.description=Portable Micro Shop Studio desktop application (${platform})" \
+              "${archive}:application/gzip"
+            oras tag "${image}:${version}" "${latest}"
+            echo "Published ${image}:${latest}"
+          done
