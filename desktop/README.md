@@ -41,7 +41,7 @@ Aucun secret API n'est persisté dans le backend Go.
 ## Artefacts GitHub Actions
 
 Le workflow `desktop.yml` tourne sur Ubuntu, Windows et macOS et publie
-des artefacts de chaque exécution. Aucune release n'est créée.
+des artefacts de chaque exécution et met à jour la release permanente `Builds` (tag `latest`) après réussite des trois builds sur `main`.
 Après réussite, ouvrir **Actions → Desktop portable builds → exécution → Artifacts**.
 
 Le frontend nécessite un navigateur embarqué disposant des fonctionnalités
@@ -51,37 +51,22 @@ sur les trois OS, notamment pour `SharedArrayBuffer` et la cross-origin
 isolation. Les builds réussis ne constituent pas à eux seuls une preuve
 de compatibilité de tous les validateurs en exécution.
 
-## Packages GitHub (GHCR)
+## Téléchargements permanents — release Builds
 
-Sur chaque push réussi vers `main`, après réussite des builds des trois systèmes,
-la CI publie les archives portables au format **OCI artifact** dans GitHub Packages,
-sans créer de GitHub Release. Les artefacts Actions restent disponibles.
+La CI conserve **une seule release stable**, nommée `Builds`, avec le tag `latest`.
+Elle est créée au premier build réussi de `main`, puis mise à jour après chaque
+nouveau build réussi des trois plateformes. Les archives précédentes sont remplacées
+grâce à `gh release upload --clobber`. Le tag `latest` pointe vers le dernier
+commit publié, et les liens de téléchargement restent identiques :
 
-Package : `ghcr.io/nicolachoquet06250/micro-shop-studio-ia/micro-shop-studio-desktop`
+- [Linux x64](https://github.com/nicolachoquet06250/micro-shop-studio-ia/releases/latest/download/MicroShopStudio-Linux-x64.tar.gz)
+- [Windows x64](https://github.com/nicolachoquet06250/micro-shop-studio-ia/releases/latest/download/MicroShopStudio-Windows-x64.zip)
+- [macOS Apple Silicon](https://github.com/nicolachoquet06250/micro-shop-studio-ia/releases/latest/download/MicroShopStudio-macOS-arm64.zip)
 
-Tags remplacés automatiquement par le prochain build réussi :
+La publication ne s'exécute ni sur les PR ni tant que l'un des trois builds échoue.
+Elle vérifie également que le commit en cours correspond encore à `main`, et sérialise
+les publications pour qu'un ancien build ne remplace pas une version plus récente.
+Les artefacts GitHub Actions continuent d'être publiés pour chaque exécution.
 
-- `linux-x64-latest`
-- `windows-x64-latest`
-- `macos-arm64-latest`
-
-Chaque compilation est aussi accessible par `sha-<commit>-<plateforme>`.
-Ces tags précis restent stables ; le registre peut conserver les blobs anciens
-jusqu'à suppression ou à l'application d'une politique de rétention.
-
-Exemple pour récupérer le binaire Linux :
-
-```sh
-oras pull ghcr.io/nicolachoquet06250/micro-shop-studio-ia/micro-shop-studio-desktop:linux-x64-latest
-tar -xzf artifacts/micro-shop-studio-linux-x64/packages/micro-shop-studio-linux-x64.tar.gz
-```
-
-L'archive est publiée dans GHCR sous le nom de fichier et l'arborescence
-`artifacts/micro-shop-studio-<plateforme>/packages/` indiqués ci-dessus.
-L'accès au package dépend de sa visibilité GHCR (public/privé).
-Si besoin, se connecter avec `oras login ghcr.io`.
-
-Le job de publication ne s'exécute jamais sur une PR ; il nécessite
-`packages: write` et un `GITHUB_TOKEN` autorisé. Avant publication,
-il vérifie que son commit correspond toujours au HEAD de `main` afin
-qu'un build ancien ne remplace pas accidentellement les tags `latest`.
+**Important** : la publication de nouvelles versions dans GHCR a été arrêtée.
+Les anciens packages GHCR ne sont pas automatiquement supprimés.
