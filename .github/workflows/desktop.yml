@@ -60,7 +60,13 @@ jobs:
         run: |
           mkdir -p build
           cp ../public/favicon.png build/appicon.png
-          "$(go env GOPATH)/bin/wails" build -clean -s -skipbindings
+          WAILS="$(go env GOPATH)/bin/wails"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then WAILS="$WAILS.exe"; fi
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            "$WAILS" build -clean -s -skipbindings -tags webkit2_41
+          else
+            "$WAILS" build -clean -s -skipbindings
+          fi
       - name: Upload desktop executable
         uses: actions/upload-artifact@v4
         with:
