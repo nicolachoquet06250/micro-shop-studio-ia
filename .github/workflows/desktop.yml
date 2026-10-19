@@ -80,8 +80,8 @@ jobs:
               powershell.exe -NoProfile -Command "Compress-Archive -Path 'desktop/build/bin/*' -DestinationPath 'desktop/build/packages/MicroShopStudio-Windows-x64.zip' -Force"
               ;;
             macos-arm64)
-              test -d desktop/build/bin/MicroShopStudio.app
-              ditto -c -k --sequesterRsrc --keepParent desktop/build/bin/MicroShopStudio.app desktop/build/packages/MicroShopStudio-macOS-arm64.zip
+              test -d desktop/build/bin/micro-shop-studio.app
+              ditto -c -k --sequesterRsrc --keepParent desktop/build/bin/micro-shop-studio.app desktop/build/packages/MicroShopStudio-macOS-arm64.zip
               ;;
           esac
 
