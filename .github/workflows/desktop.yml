@@ -78,7 +78,8 @@ jobs:
         with:
           name: micro-shop-studio-${{ matrix.name }}
           path: |
-            desktop/build/bin/**\n            desktop/build/packages/**
+            desktop/build/bin/**
+            desktop/build/packages/**
           if-no-files-found: error
           retention-days: 14
 
