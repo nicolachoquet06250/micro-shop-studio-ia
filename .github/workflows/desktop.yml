@@ -67,11 +67,23 @@ jobs:
           else
             "$WAILS" build -clean -s -skipbindings
           fi
-      - name: Package portable executable (preserve executable permissions)
+      - name: Package platform downloads
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p desktop/build/packages
-          tar -czf "desktop/build/packages/micro-shop-studio-${{ matrix.name }}.tar.gz" -C desktop/build/bin .
+          case "${{ matrix.name }}" in
+            linux-x64)
+              tar -czf desktop/build/packages/MicroShopStudio-Linux-x64.tar.gz -C desktop/build/bin .
+              ;;
+            windows-x64)
+              powershell.exe -NoProfile -Command "Compress-Archive -Path 'desktop/build/bin/*' -DestinationPath 'desktop/build/packages/MicroShopStudio-Windows-x64.zip' -Force"
+              ;;
+            macos-arm64)
+              test -d desktop/build/bin/micro-shop-studio.app
+              ditto -c -k --sequesterRsrc --keepParent desktop/build/bin/micro-shop-studio.app desktop/build/packages/MicroShopStudio-macOS-arm64.zip
+              ;;
+          esac
 
       - name: Upload desktop executable
         uses: actions/upload-artifact@v4
@@ -83,71 +95,66 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish-ghcr:
-    name: Publish desktop packages to GHCR
+  publish-release:
+    name: Publish or update Builds release
     needs: desktop
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: write
     concurrency:
-      group: desktop-ghcr-publication
+      group: desktop-latest-release
       cancel-in-progress: false
     steps:
-      - name: Download platform artifacts
+      - name: Download all platform archives
         uses: actions/download-artifact@v4
         with:
           pattern: micro-shop-studio-*
           path: artifacts
-          merge-multiple: false
 
-      - name: Install ORAS CLI
-        uses: oras-project/setup-oras@v2
+      - name: Check all three distributables
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp artifacts/micro-shop-studio-linux-x64/packages/MicroShopStudio-Linux-x64.tar.gz release-assets/
+          cp artifacts/micro-shop-studio-windows-x64/packages/MicroShopStudio-Windows-x64.zip release-assets/
+          cp artifacts/micro-shop-studio-macos-arm64/packages/MicroShopStudio-macOS-arm64.zip release-assets/
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 3
+          for archive in release-assets/*; do test -s "$archive"; done
+          tar -tzf release-assets/MicroShopStudio-Linux-x64.tar.gz > /dev/null
+          unzip -t release-assets/MicroShopStudio-Windows-x64.zip > /dev/null
+          unzip -t release-assets/MicroShopStudio-macOS-arm64.zip > /dev/null
 
-      - name: Sign in to GHCR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Publish only if this is still the latest main commit
-        id: latest
+      - name: Create or update stable latest release and replace archives
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          current="$(curl --fail --silent --show-error \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" | jq -r '.object.sha')"
-          if [[ "$current" == "$GITHUB_SHA" ]]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Skipping stale build: main moved to $current"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+          # Reject old workflow runs: only the current main HEAD can replace latest.
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$current" != "$GITHUB_SHA" ]]; then
+            echo "Skipping outdated build ${GITHUB_SHA}; current main is ${current}"
+            exit 0
           fi
 
-      - name: Publish Linux, Windows and macOS OCI artifacts
-        if: steps.latest.outputs.publish == 'true'
-        env:
-          REPOSITORY: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${REPOSITORY,,}/micro-shop-studio-desktop"
-          for platform in linux-x64 windows-x64 macos-arm64; do
-            archive="artifacts/micro-shop-studio-${platform}/packages/micro-shop-studio-${platform}.tar.gz"
-            test -s "$archive"
-            version="sha-${COMMIT_SHA}-${platform}"
-            latest="${platform}-latest"
-            oras push "${image}:${version}" \
-              --artifact-type "application/vnd.micro-shop-studio.desktop.v1" \
-              --annotation "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
-              --annotation "org.opencontainers.image.revision=${COMMIT_SHA}" \
-              --annotation "org.opencontainers.image.description=Portable Micro Shop Studio desktop application (${platform})" \
-              "${archive}:application/gzip"
-            oras tag "${image}:${version}" "${latest}"
-            echo "Published ${image}:${latest}"
-          done
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/latest" -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          if gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit latest --repo "$GITHUB_REPOSITORY" --title "Builds" --latest \
+              --notes "Exécutables portables Linux, Windows et macOS. Build du commit ${GITHUB_SHA}. Les trois archives sont remplacées à chaque build réussi de main."
+          else
+            gh release create latest --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Builds" --latest \
+              --notes "Exécutables portables Linux, Windows et macOS. Build du commit ${GITHUB_SHA}. Les trois archives sont remplacées à chaque build réussi de main."
+          fi
+
+          gh release upload latest --repo "$GITHUB_REPOSITORY" --clobber release-assets/*
+          echo "Updated Builds / latest for commit ${GITHUB_SHA}"
