@@ -5,7 +5,6 @@ import (
  "encoding/hex"
  "net"
  "net/http"
- "strings"
 )
 
 type Bridge struct {
@@ -28,7 +27,7 @@ func (b *Bridge) Close() { _=b.listener.Close() }
 func (b *Bridge) handle(w http.ResponseWriter,r *http.Request) {
  origin:=r.Header.Get("Origin")
  if origin!="" {
-  if !strings.HasPrefix(origin,"http://wails.localhost") && !strings.HasPrefix(origin,"https://wails.localhost") {
+  if origin!="http://wails.localhost" && origin!="https://wails.localhost" {
    http.Error(w,"Forbidden",http.StatusForbidden);return
   }
   w.Header().Set("Access-Control-Allow-Origin",origin)
