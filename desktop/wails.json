@@ -1,0 +1,12 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "micro-shop-studio",
+  "outputfilename": "MicroShopStudio",
+  "frontend:dir": "frontend",
+  "frontend:install": "echo preinstalled",
+  "frontend:build": "echo prebuilt",
+  "frontend:dev:watcher": "echo prebuilt",
+  "author": {
+    "name": "Micro Shop Studio"
+  }
+}
