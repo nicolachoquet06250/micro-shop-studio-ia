@@ -1,3 +1,4 @@
+import './bridge';
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import GeneratorApp from '../../src/components/GeneratorApp.vue';
