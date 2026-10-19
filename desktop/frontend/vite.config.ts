@@ -2,10 +2,11 @@ import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// Same PHP.wasm workaround as astro.config.mjs: import the binary as an asset URL.
+const root = dirname(fileURLToPath(import.meta.url));
 const phpWasmAssetUrlPlugin = () => {
-  const prefix = '\\0micro-shop:php-wasm-asset-url:';
+  const prefix = '\0micro-shop:php-wasm-asset-url:';
   return {
     name: 'desktop-php-wasm-asset-url',
     enforce: 'pre' as const,
@@ -23,8 +24,8 @@ const phpWasmAssetUrlPlugin = () => {
 };
 
 export default defineConfig({
-  root: resolve(import.meta.dirname, '.'),
-  publicDir: resolve(import.meta.dirname, '../../public'),
+  root,
+  publicDir: resolve(root, '../../public'),
   base: '/',
   plugins: [phpWasmAssetUrlPlugin(), vue()],
   assetsInclude: [/\.dat$/i, /\.wasm$/i, /\.so$/i, /\.la$/i],
