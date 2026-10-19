@@ -4,25 +4,37 @@ import { readFileSync } from 'node:fs';
 
 const workflow = readFileSync(new URL('../.github/workflows/desktop.yml', import.meta.url), 'utf8');
 
-test('GHCR publication requires all three desktop builds and only main', () => {
-  assert.match(workflow, /publish-ghcr:[\s\S]*?needs: desktop/);
+test('release publication waits for successful builds on main, never runs on PR', () => {
+  assert.match(workflow, /publish-release:[\s\S]*?needs: desktop/);
   assert.match(workflow, /github\.event_name != 'pull_request' && github\.ref == 'refs\/heads\/main'/);
-  assert.match(workflow, /packages: write/);
-  assert.match(workflow, /steps\.latest\.outputs\.publish == 'true'/);
+  assert.match(workflow, /contents: write/);
+  assert.match(workflow, /desktop-latest-release/);
+  assert.match(workflow, /current.*GITHUB_SHA/);
 });
 
-test('latest is per platform and commit-specific tags are kept', () => {
-  for (const os of ['linux-x64', 'windows-x64', 'macos-arm64']) {
-    assert.ok(workflow.includes(os), `Missing ${os}`);
-  }
-  assert.match(workflow, /version="sha-\$\{COMMIT_SHA\}-\$\{platform\}"/);
-  assert.match(workflow, /latest="\$\{platform\}-latest"/);
-  assert.match(workflow, /oras tag/);
-  assert.doesNotMatch(workflow, /gh release|create-release|actions\/create-release/);
+test('one stable, published latest release with replacement archives', () => {
+  assert.match(workflow, /gh release view latest/);
+  assert.match(workflow, /gh release create latest/);
+  assert.match(workflow, /gh release edit latest/);
+  assert.match(workflow, /--title "Builds"/);
+  assert.match(workflow, /--latest/);
+  assert.match(workflow, /gh release upload latest.*--clobber/);
+  assert.match(workflow, /git\/refs\/tags\/latest/);
+  assert.doesNotMatch(workflow, /publish-ghcr|oras push|packages: write/);
 });
 
-test('downloadable CI artifacts and portable archives remain available', () => {
+test('distributables use consistent direct download filenames', () => {
+  for (const filename of [
+    'MicroShopStudio-Linux-x64.tar.gz',
+    'MicroShopStudio-Windows-x64.zip',
+    'MicroShopStudio-macOS-arm64.zip',
+  ]) assert.ok(workflow.includes(filename), filename);
+  assert.match(workflow, /tar -tzf/);
+  assert.match(workflow, /unzip -t/);
+});
+
+test('CI artifacts remain available independently of GitHub Releases', () => {
   assert.match(workflow, /actions\/upload-artifact@v4/);
-  assert.match(workflow, /tar -czf/);
   assert.match(workflow, /actions\/download-artifact@v4/);
+  assert.match(workflow, /retention-days: 14/);
 });
