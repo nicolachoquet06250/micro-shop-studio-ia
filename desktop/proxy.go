@@ -25,6 +25,15 @@ func jsonError(w http.ResponseWriter,status int,kind,message string) {
  _=json.NewEncoder(w).Encode(map[string]any{"error":map[string]string{"type":kind,"message":message}})
 }
 func handleAPI(w http.ResponseWriter,r *http.Request) {
+ if r.Method=="GET" && (r.URL.Path=="/settings" || r.URL.Path=="/settings/") {
+  page,err:=assets.ReadFile("frontend/dist/index.html")
+  if err!=nil {http.Error(w,"Missing desktop frontend",500);return}
+  w.Header().Set("Content-Type","text/html; charset=utf-8")
+  w.Header().Set("Cross-Origin-Opener-Policy","same-origin")
+  w.Header().Set("Cross-Origin-Embedder-Policy","require-corp")
+  _,_=w.Write(page)
+  return
+ }
  if !strings.HasPrefix(r.URL.Path,"/api/openai/") { http.NotFound(w,r);return }
  w.Header().Set("Cross-Origin-Opener-Policy","same-origin")
  w.Header().Set("Cross-Origin-Embedder-Policy","require-corp")
